@@ -30,6 +30,7 @@
 - [x] Language/title/text alternative value validation refined.
 - [x] Analysis-only job reporting implemented.
 - [x] OCR job reporting implemented.
+- [x] OCR provider registry and logging implemented.
 - [x] Redaction engine and job workflow implemented.
 
 ## API

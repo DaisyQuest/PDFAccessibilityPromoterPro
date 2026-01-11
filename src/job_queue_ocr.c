@@ -107,8 +107,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *provider_name = getenv("PAP_OCR_PROVIDER");
+    if (provider_name && provider_name[0] != '\0') {
+        fprintf(stderr, "Using OCR provider '%s'.\n", provider_name);
+    }
+
     pocr_report_t report;
-    pocr_result_t scan_result = pocr_scan_file(pdf_locked, &report);
+    pocr_result_t scan_result = pocr_scan_file_with_provider(provider_name, pdf_locked, &report);
     if (scan_result != POCR_OK) {
         const char *detail = pocr_result_str(scan_result);
         write_error_metadata(metadata_locked, detail);
