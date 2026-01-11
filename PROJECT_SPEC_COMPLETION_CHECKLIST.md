@@ -19,11 +19,14 @@
 - [ ] Large file (5GB+) transfer verified.
 - [ ] Parallel processing validated.
 - [ ] Benchmarks documented.
+- [x] Large file job submission copy optimized and validated.
+- [x] Job submission uses atomic temp-file staging.
 
 ## PDF Accessibility Processing
 - [x] Tagging/structure parsing implemented.
 - [x] Accessibility issue detection implemented.
 - [x] Accessibility report generation implemented.
+- [x] Language/title/text alternative value validation refined.
 
 ## API
 - [x] Job submission API implemented.

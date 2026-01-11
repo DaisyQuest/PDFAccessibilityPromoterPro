@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -68,40 +69,133 @@ static jq_result_t jq_copy_file(const char *src_path, const char *dst_path) {
         return JQ_ERR_INVALID_ARGUMENT;
     }
 
+    char tmp_path[PATH_MAX];
+    int tmp_written = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", dst_path);
+    if (tmp_written < 0 || (size_t)tmp_written >= sizeof(tmp_path)) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
     int src_fd = open(src_path, O_RDONLY);
     if (src_fd < 0) {
         return errno == ENOENT ? JQ_ERR_NOT_FOUND : JQ_ERR_IO;
     }
 
-    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    struct stat src_stat;
+    if (fstat(src_fd, &src_stat) != 0) {
+        close(src_fd);
+        return JQ_ERR_IO;
+    }
+
+    int dst_fd = mkstemp(tmp_path);
     if (dst_fd < 0) {
         close(src_fd);
         return JQ_ERR_IO;
     }
 
-    char buffer[1024 * 1024];
-    ssize_t bytes_read;
-    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
-        ssize_t bytes_written = 0;
-        while (bytes_written < bytes_read) {
-            ssize_t chunk = write(dst_fd, buffer + bytes_written, bytes_read - bytes_written);
-            if (chunk < 0) {
+    mode_t mode = src_stat.st_mode & 0777;
+    if (fchmod(dst_fd, mode) != 0) {
+        close(src_fd);
+        close(dst_fd);
+        unlink(tmp_path);
+        return JQ_ERR_IO;
+    }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    (void)posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+#if defined(POSIX_FADV_NOREUSE)
+    (void)posix_fadvise(src_fd, 0, 0, POSIX_FADV_NOREUSE);
+#endif
+    if (src_stat.st_size > 0) {
+        int fallocate_result = posix_fallocate(dst_fd, 0, src_stat.st_size);
+        if (fallocate_result != 0 && fallocate_result != EINTR) {
+            if (ftruncate(dst_fd, src_stat.st_size) != 0) {
                 close(src_fd);
                 close(dst_fd);
+                unlink(tmp_path);
+                return JQ_ERR_IO;
+            }
+        }
+    }
+
+    char stack_buffer[16 * 1024];
+    size_t buffer_size = 1024 * 1024;
+    char *buffer = malloc(buffer_size);
+    if (!buffer) {
+        buffer = stack_buffer;
+        buffer_size = sizeof(stack_buffer);
+    }
+    ssize_t bytes_read;
+    while (1) {
+        bytes_read = read(src_fd, buffer, buffer_size);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(src_fd);
+            close(dst_fd);
+            if (buffer != stack_buffer) {
+                free(buffer);
+            }
+            unlink(tmp_path);
+            return JQ_ERR_IO;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        ssize_t bytes_written = 0;
+        while (bytes_written < bytes_read) {
+            ssize_t chunk = write(dst_fd, buffer + bytes_written, (size_t)(bytes_read - bytes_written));
+            if (chunk < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(src_fd);
+                close(dst_fd);
+                if (buffer != stack_buffer) {
+                    free(buffer);
+                }
+                unlink(tmp_path);
                 return JQ_ERR_IO;
             }
             bytes_written += chunk;
         }
     }
 
-    if (bytes_read < 0) {
+    if (fsync(dst_fd) != 0) {
         close(src_fd);
         close(dst_fd);
+        if (buffer != stack_buffer) {
+            free(buffer);
+        }
+        unlink(tmp_path);
         return JQ_ERR_IO;
     }
 
     close(src_fd);
     close(dst_fd);
+    if (buffer != stack_buffer) {
+        free(buffer);
+    }
+
+    if (rename(tmp_path, dst_path) != 0) {
+        unlink(tmp_path);
+        return JQ_ERR_IO;
+    }
+
+    const char *slash = strrchr(dst_path, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - dst_path);
+        if (dir_len > 0 && dir_len < PATH_MAX) {
+            char dir_path[PATH_MAX];
+            memcpy(dir_path, dst_path, dir_len);
+            dir_path[dir_len] = '\0';
+            int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
+            if (dir_fd >= 0) {
+                (void)fsync(dir_fd);
+                close(dir_fd);
+            }
+        }
+    }
     return JQ_OK;
 }
 

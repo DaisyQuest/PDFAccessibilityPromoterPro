@@ -294,6 +294,98 @@ static int test_analyze_missing_mcid(void) {
            assert_true(has_missing_mcid, "missing mcid issue");
 }
 
+static int test_analyze_text_alternatives_variants(void) {
+    char template[] = "/tmp/pap_pdfa_alt_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char alt_path[PATH_MAX];
+    snprintf(alt_path, sizeof(alt_path), "%s/alt.pdf", root);
+    const char *alt_contents =
+        "%PDF-1.7\n"
+        "<< /Catalog /Pages /StructTreeRoot /Lang (en-US) >>\n"
+        "<< /Alt (Figure description) >>\n";
+    if (!assert_true(write_file(alt_path, alt_contents), "write alt-only pdf")) {
+        return 0;
+    }
+
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(alt_path, &report) == PDFA_OK, "analyze alt-only pdf")) {
+        return 0;
+    }
+
+    int has_missing_alt = 0;
+    for (size_t i = 0; i < report.issue_count; ++i) {
+        if (report.issues[i] == PDFA_ISSUE_MISSING_TEXT_ALTERNATIVES) {
+            has_missing_alt = 1;
+        }
+    }
+    if (!assert_true(report.has_alt_text, "alt text present") ||
+        !assert_true(!report.has_actual_text, "actual text absent") ||
+        !assert_true(!has_missing_alt, "no missing alt issue when alt text present")) {
+        return 0;
+    }
+
+    char actual_path[PATH_MAX];
+    snprintf(actual_path, sizeof(actual_path), "%s/actual.pdf", root);
+    const char *actual_contents =
+        "%PDF-1.7\n"
+        "<< /Catalog /Pages /StructTreeRoot /Lang (en-US) >>\n"
+        "<< /ActualText (Replacement text) >>\n";
+    if (!assert_true(write_file(actual_path, actual_contents), "write actual-text-only pdf")) {
+        return 0;
+    }
+
+    if (!assert_true(pdfa_analyze_file(actual_path, &report) == PDFA_OK, "analyze actual-text-only pdf")) {
+        return 0;
+    }
+
+    int has_missing_actual = 0;
+    for (size_t i = 0; i < report.issue_count; ++i) {
+        if (report.issues[i] == PDFA_ISSUE_MISSING_TEXT_ALTERNATIVES) {
+            has_missing_actual = 1;
+        }
+    }
+
+    return assert_true(!report.has_alt_text, "alt text absent") &&
+           assert_true(report.has_actual_text, "actual text present") &&
+           assert_true(!has_missing_actual, "no missing alt issue when actual text present");
+}
+
+static int test_analyze_lang_requires_value(void) {
+    char template[] = "/tmp/pap_pdfa_lang_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/lang.pdf", root);
+    const char *contents =
+        "%PDF-1.7\n"
+        "<< /Type /Catalog /Pages 2 0 R /Lang >>\n";
+    if (!assert_true(write_file(path, contents), "write lang missing value pdf")) {
+        return 0;
+    }
+
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(path, &report) == PDFA_OK, "analyze lang missing value pdf")) {
+        return 0;
+    }
+
+    int has_missing_lang = 0;
+    for (size_t i = 0; i < report.issue_count; ++i) {
+        if (report.issues[i] == PDFA_ISSUE_MISSING_LANGUAGE) {
+            has_missing_lang = 1;
+        }
+    }
+
+    return assert_true(!report.has_lang, "lang value absent") &&
+           assert_true(has_missing_lang, "missing lang issue");
+}
+
 static int test_json_invalid_args(void) {
     char buffer[32];
     pdfa_report_t report;
@@ -317,7 +409,8 @@ static int test_json_buffer_too_small(void) {
     snprintf(path, sizeof(path), "%s/complete.pdf", root);
     const char *contents =
         "%PDF-1.7\n"
-        "<< /Catalog /Pages /Outlines /StructTreeRoot /Lang /Alt /ActualText /Title /Marked true /DisplayDocTitle true /RoleMap <<>> /Metadata 5 0 R >>\n"
+        "<< /Catalog /Pages /Outlines /StructTreeRoot /Lang (en-US) /Alt (alt) /ActualText (actual) /Title (Doc) "
+        "/Marked true /DisplayDocTitle true /RoleMap <<>> /Metadata 5 0 R >>\n"
         "<< /MarkInfo << /Marked true >> /ViewerPreferences << /DisplayDocTitle true >> /ParentTree 6 0 R >>\n"
         "<< /StructParents 1 /MCID 0 >>\n";
     if (!assert_true(write_file(path, contents), "write pdf for json")) {
@@ -345,7 +438,8 @@ static int test_json_success(void) {
     snprintf(path, sizeof(path), "%s/complete.pdf", root);
     const char *contents =
         "%PDF-1.6\n"
-        "<< /Catalog /Pages /Outlines /StructTreeRoot /Lang /Alt /ActualText /Title /Marked true /DisplayDocTitle true /RoleMap <<>> /Metadata 5 0 R >>\n"
+        "<< /Catalog /Pages /Outlines /StructTreeRoot /Lang (en-US) /Alt (alt) /ActualText (actual) /Title (Doc) "
+        "/Marked true /DisplayDocTitle true /RoleMap <<>> /Metadata 5 0 R >>\n"
         "<< /MarkInfo << /Marked true >> /ViewerPreferences << /DisplayDocTitle true >> /ParentTree 6 0 R >>\n"
         "<< /StructParents 1 /MCID 0 >>\n";
     if (!assert_true(write_file(path, contents), "write pdf for json success")) {
@@ -401,6 +495,8 @@ int main(void) {
     ok &= test_analyze_missing_features();
     ok &= test_analyze_marked_flags();
     ok &= test_analyze_missing_mcid();
+    ok &= test_analyze_text_alternatives_variants();
+    ok &= test_analyze_lang_requires_value();
     ok &= test_json_invalid_args();
     ok &= test_json_buffer_too_small();
     ok &= test_json_success();

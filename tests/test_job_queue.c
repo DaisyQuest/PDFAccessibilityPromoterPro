@@ -1,6 +1,8 @@
 #include "pap/job_queue.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +42,119 @@ static int read_file(const char *path, char *buffer, size_t buffer_len) {
     buffer[bytes] = '\0';
     fclose(fp);
     return 1;
+}
+
+static int write_pattern_file(const char *path, size_t bytes, unsigned char seed, mode_t mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) {
+        return 0;
+    }
+    if (fchmod(fd, mode) != 0) {
+        close(fd);
+        return 0;
+    }
+    unsigned char buffer[4096];
+    for (size_t i = 0; i < sizeof(buffer); ++i) {
+        buffer[i] = (unsigned char)(seed + (i % 251));
+    }
+    size_t remaining = bytes;
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buffer) ? sizeof(buffer) : remaining;
+        size_t written = 0;
+        while (written < chunk) {
+            ssize_t result = write(fd, buffer + written, chunk - written);
+            if (result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(fd);
+                return 0;
+            }
+            written += (size_t)result;
+        }
+        remaining -= chunk;
+    }
+    close(fd);
+    return 1;
+}
+
+static int compare_files(const char *left, const char *right) {
+    int left_fd = open(left, O_RDONLY);
+    if (left_fd < 0) {
+        return 0;
+    }
+    int right_fd = open(right, O_RDONLY);
+    if (right_fd < 0) {
+        close(left_fd);
+        return 0;
+    }
+
+    struct stat left_stat;
+    struct stat right_stat;
+    if (fstat(left_fd, &left_stat) != 0 || fstat(right_fd, &right_stat) != 0) {
+        close(left_fd);
+        close(right_fd);
+        return 0;
+    }
+    if (left_stat.st_size != right_stat.st_size) {
+        close(left_fd);
+        close(right_fd);
+        return 0;
+    }
+
+    unsigned char left_buf[8192];
+    unsigned char right_buf[8192];
+    ssize_t left_read;
+    while ((left_read = read(left_fd, left_buf, sizeof(left_buf))) > 0) {
+        ssize_t right_read = 0;
+        while (right_read < left_read) {
+            ssize_t chunk = read(right_fd, right_buf + right_read, (size_t)(left_read - right_read));
+            if (chunk < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(left_fd);
+                close(right_fd);
+                return 0;
+            }
+            if (chunk == 0) {
+                close(left_fd);
+                close(right_fd);
+                return 0;
+            }
+            right_read += chunk;
+        }
+        if (memcmp(left_buf, right_buf, (size_t)left_read) != 0) {
+            close(left_fd);
+            close(right_fd);
+            return 0;
+        }
+    }
+    if (left_read < 0) {
+        close(left_fd);
+        close(right_fd);
+        return 0;
+    }
+
+    close(left_fd);
+    close(right_fd);
+    return 1;
+}
+
+static int directory_has_tmp_files(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        return 0;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, ".tmp.") != NULL) {
+            closedir(dir);
+            return 1;
+        }
+    }
+    closedir(dir);
+    return 0;
 }
 
 static int create_job_files(const char *root, const char *uuid, int priority) {
@@ -308,6 +423,171 @@ static int test_move_partial_pair(void) {
 static int test_submit_invalid_args(void) {
     return assert_true(jq_submit(NULL, "id", "pdf", "meta", 0) == JQ_ERR_INVALID_ARGUMENT,
                        "jq_submit should reject NULL root");
+}
+
+static int test_submit_large_files(void) {
+    char template[] = "/tmp/pap_test_large_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for large files")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/large.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/large.metadata", root);
+
+    size_t pdf_size = (1024 * 1024 * 3) + 123;
+    size_t metadata_size = (1024 * 512) + 17;
+    if (!assert_true(write_pattern_file(pdf_src, pdf_size, 17, 0600), "write large pdf")) {
+        return 0;
+    }
+    if (!assert_true(write_pattern_file(metadata_src, metadata_size, 99, 0640), "write large metadata")) {
+        return 0;
+    }
+
+    jq_result_t submit_result = jq_submit(root, "job-large", pdf_src, metadata_src, 0);
+    if (!assert_true(submit_result == JQ_OK, "jq_submit large files")) {
+        return 0;
+    }
+
+    char pdf_dest[PATH_MAX];
+    char metadata_dest[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-large", JQ_STATE_JOBS,
+                                  pdf_dest, sizeof(pdf_dest),
+                                  metadata_dest, sizeof(metadata_dest)) == JQ_OK,
+                     "job paths for large files")) {
+        return 0;
+    }
+
+    if (!assert_true(compare_files(pdf_src, pdf_dest), "pdf contents preserved")) {
+        return 0;
+    }
+    if (!assert_true(compare_files(metadata_src, metadata_dest), "metadata contents preserved")) {
+        return 0;
+    }
+
+    struct stat pdf_stat;
+    struct stat metadata_stat;
+    if (!assert_true(stat(pdf_dest, &pdf_stat) == 0, "stat pdf dest")) {
+        return 0;
+    }
+    if (!assert_true(stat(metadata_dest, &metadata_stat) == 0, "stat metadata dest")) {
+        return 0;
+    }
+    if (!assert_true((pdf_stat.st_mode & 0777) == 0600, "pdf mode preserved")) {
+        return 0;
+    }
+    if (!assert_true((metadata_stat.st_mode & 0777) == 0640, "metadata mode preserved")) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int test_submit_atomic_cleanup(void) {
+    char template[] = "/tmp/pap_test_atomic_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for atomic submit")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/atomic.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/atomic.metadata", root);
+
+    if (!assert_true(write_pattern_file(pdf_src, 1024 * 128, 7, 0600), "write atomic pdf")) {
+        return 0;
+    }
+    if (!assert_true(write_pattern_file(metadata_src, 1024 * 64, 3, 0644), "write atomic metadata")) {
+        return 0;
+    }
+
+    jq_result_t submit_result = jq_submit(root, "job-atomic", pdf_src, metadata_src, 0);
+    if (!assert_true(submit_result == JQ_OK, "jq_submit atomic")) {
+        return 0;
+    }
+
+    char jobs_dir[PATH_MAX];
+    snprintf(jobs_dir, sizeof(jobs_dir), "%s/jobs", root);
+    return assert_true(!directory_has_tmp_files(jobs_dir), "no temp files after submit");
+}
+
+static int test_submit_missing_dir_cleanup(void) {
+    char template[] = "/tmp/pap_test_missing_dir_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for perm submit")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/perm.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/perm.metadata", root);
+
+    if (!assert_true(write_pattern_file(pdf_src, 1024 * 32, 11, 0600), "write perm pdf")) {
+        return 0;
+    }
+    if (!assert_true(write_pattern_file(metadata_src, 1024 * 16, 22, 0644), "write perm metadata")) {
+        return 0;
+    }
+
+    char jobs_dir[PATH_MAX];
+    char jobs_backup[PATH_MAX];
+    snprintf(jobs_dir, sizeof(jobs_dir), "%s/jobs", root);
+    snprintf(jobs_backup, sizeof(jobs_backup), "%s/jobs_backup", root);
+    if (rename(jobs_dir, jobs_backup) != 0) {
+        perror("rename jobs dir");
+        return 0;
+    }
+
+    jq_result_t submit_result = jq_submit(root, "job-perm", pdf_src, metadata_src, 0);
+    if (!assert_true(submit_result == JQ_ERR_IO, "jq_submit missing jobs dir")) {
+        rename(jobs_backup, jobs_dir);
+        return 0;
+    }
+
+    if (!assert_true(!directory_has_tmp_files(root), "no temp files after failure")) {
+        rename(jobs_backup, jobs_dir);
+        return 0;
+    }
+
+    char pdf_dest[PATH_MAX];
+    char metadata_dest[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-perm", JQ_STATE_JOBS,
+                                  pdf_dest, sizeof(pdf_dest),
+                                  metadata_dest, sizeof(metadata_dest)) == JQ_OK,
+                     "paths for missing dir job")) {
+        rename(jobs_backup, jobs_dir);
+        return 0;
+    }
+    if (!assert_true(!file_exists(pdf_dest), "pdf not created on failure")) {
+        rename(jobs_backup, jobs_dir);
+        return 0;
+    }
+    if (!assert_true(!file_exists(metadata_dest), "metadata not created on failure")) {
+        rename(jobs_backup, jobs_dir);
+        return 0;
+    }
+
+    rename(jobs_backup, jobs_dir);
+    return 1;
 }
 
 static int test_job_paths_invalid_state(void) {
@@ -732,6 +1012,9 @@ int main(void) {
     passed &= test_move_missing_job();
     passed &= test_move_partial_pair();
     passed &= test_submit_invalid_args();
+    passed &= test_submit_large_files();
+    passed &= test_submit_atomic_cleanup();
+    passed &= test_submit_missing_dir_cleanup();
     passed &= test_job_paths_invalid_state();
     passed &= test_move_invalid_state();
     passed &= test_claim_uuid_too_small();
