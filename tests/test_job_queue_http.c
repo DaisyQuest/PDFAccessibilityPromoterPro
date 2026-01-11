@@ -396,6 +396,128 @@ static int test_http_claim_empty(void) {
     return 1;
 }
 
+static int test_http_status_and_retrieve(void) {
+    char template[] = "/tmp/pap_test_http_status_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for status")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for status")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for status")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9104;
+    if (!assert_true(start_server(root, port, &pid), "start server for status")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=status-job&pdf=%s&metadata=%s'",
+             "%{http_code}", port, pdf_src, metadata_src);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit status job")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "submit status job 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/status?uuid=status-job", port);
+    char output[RESPONSE_BUFFER];
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "status unlocked request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "state=jobs locked=0") != NULL, "status unlocked response")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/claim", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "claim for status")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/status?uuid=status-job", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "status locked request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "state=jobs locked=1") != NULL, "status locked response")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/finalize?uuid=status-job&from=jobs&to=complete'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "finalize for status")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "finalize status 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/status?uuid=status-job", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "status complete request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "state=complete locked=0") != NULL, "status complete response")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s 'http://127.0.0.1:%d/retrieve?uuid=status-job&state=complete&kind=metadata'",
+             port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "retrieve metadata")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strncmp(output, "metadata", strlen("metadata")) == 0, "metadata response")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s 'http://127.0.0.1:%d/retrieve?uuid=status-job&state=complete&kind=pdf'",
+             port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "retrieve pdf")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strncmp(output, "pdf data", strlen("pdf data")) == 0, "pdf response")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_http_submit_claim_finalize();
@@ -403,6 +525,7 @@ int main(void) {
     passed &= test_http_invalid_method_and_not_found();
     passed &= test_http_missing_params();
     passed &= test_http_claim_empty();
+    passed &= test_http_status_and_retrieve();
 
     if (!passed) {
         fprintf(stderr, "Some HTTP tests failed.\n");

@@ -425,6 +425,100 @@ static int test_finalize_invalid_args(void) {
                        "jq_finalize should reject NULL root");
 }
 
+static int test_status_unlocked_and_locked(void) {
+    char template[] = "/tmp/pap_test_status_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for status")) {
+        return 0;
+    }
+
+    if (!assert_true(create_job_files(root, "job-status", 0), "create job for status")) {
+        return 0;
+    }
+
+    jq_state_t state = JQ_STATE_ERROR;
+    int locked = 1;
+    jq_result_t status_result = jq_status(root, "job-status", &state, &locked);
+    if (!assert_true(status_result == JQ_OK, "status for unlocked job")) {
+        return 0;
+    }
+    if (!assert_true(state == JQ_STATE_JOBS, "status state matches")) {
+        return 0;
+    }
+    if (!assert_true(locked == 0, "status unlocked flag")) {
+        return 0;
+    }
+
+    char uuid[64];
+    jq_state_t claim_state = JQ_STATE_JOBS;
+    jq_result_t claim_result = jq_claim_next(root, 0, uuid, sizeof(uuid), &claim_state);
+    if (!assert_true(claim_result == JQ_OK, "claim for status")) {
+        return 0;
+    }
+
+    state = JQ_STATE_ERROR;
+    locked = 0;
+    status_result = jq_status(root, "job-status", &state, &locked);
+    if (!assert_true(status_result == JQ_OK, "status for locked job")) {
+        return 0;
+    }
+    if (!assert_true(state == JQ_STATE_JOBS, "status locked state")) {
+        return 0;
+    }
+    if (!assert_true(locked == 1, "status locked flag")) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int test_status_not_found(void) {
+    char template[] = "/tmp/pap_test_status_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for status missing")) {
+        return 0;
+    }
+
+    jq_state_t state = JQ_STATE_JOBS;
+    int locked = 0;
+    return assert_true(jq_status(root, "missing", &state, &locked) == JQ_ERR_NOT_FOUND,
+                       "status missing returns not found");
+}
+
+static int test_status_partial_pair(void) {
+    char template[] = "/tmp/pap_test_status_partial_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for status partial")) {
+        return 0;
+    }
+
+    char orphan_pdf[PATH_MAX];
+    snprintf(orphan_pdf, sizeof(orphan_pdf), "%s/jobs/partial.pdf.job", root);
+    if (!assert_true(write_file(orphan_pdf, "pdf data"), "write partial pdf")) {
+        return 0;
+    }
+
+    jq_state_t state = JQ_STATE_JOBS;
+    int locked = 0;
+    return assert_true(jq_status(root, "partial", &state, &locked) == JQ_ERR_IO,
+                       "status partial pair returns io error");
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_init_invalid();
@@ -442,6 +536,9 @@ int main(void) {
     passed &= test_claim_skips_orphan();
     passed &= test_release_invalid_args();
     passed &= test_finalize_invalid_args();
+    passed &= test_status_unlocked_and_locked();
+    passed &= test_status_not_found();
+    passed &= test_status_partial_pair();
 
     if (!passed) {
         fprintf(stderr, "Some tests failed.\n");

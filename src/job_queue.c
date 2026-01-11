@@ -206,6 +206,32 @@ static jq_result_t jq_rename(const char *src, const char *dst) {
     return JQ_ERR_IO;
 }
 
+static jq_result_t jq_check_pair_exists(const char *pdf_path, const char *metadata_path, int *present_out) {
+    if (!pdf_path || !metadata_path || !present_out) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    int pdf_ok = access(pdf_path, F_OK) == 0;
+    int pdf_errno = errno;
+    int metadata_ok = access(metadata_path, F_OK) == 0;
+    int metadata_errno = errno;
+
+    if (pdf_ok && metadata_ok) {
+        *present_out = 1;
+        return JQ_OK;
+    }
+
+    if (!pdf_ok && !metadata_ok) {
+        if (pdf_errno != ENOENT || metadata_errno != ENOENT) {
+            return JQ_ERR_IO;
+        }
+        *present_out = 0;
+        return JQ_OK;
+    }
+
+    return JQ_ERR_IO;
+}
+
 jq_result_t jq_move(const char *root_path,
                     const char *uuid,
                     jq_state_t from_state,
@@ -243,6 +269,60 @@ jq_result_t jq_move(const char *root_path,
     }
 
     return JQ_OK;
+}
+
+jq_result_t jq_status(const char *root_path,
+                      const char *uuid,
+                      jq_state_t *state_out,
+                      int *locked_out) {
+    if (!root_path || !uuid || !state_out || !locked_out) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    const jq_state_t states[] = {JQ_STATE_PRIORITY, JQ_STATE_JOBS, JQ_STATE_COMPLETE, JQ_STATE_ERROR};
+
+    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+        char pdf_path[PATH_MAX];
+        char metadata_path[PATH_MAX];
+        jq_result_t path_result =
+            jq_job_paths(root_path, uuid, states[i], pdf_path, sizeof(pdf_path), metadata_path, sizeof(metadata_path));
+        if (path_result != JQ_OK) {
+            return path_result;
+        }
+
+        int present = 0;
+        jq_result_t check_result = jq_check_pair_exists(pdf_path, metadata_path, &present);
+        if (check_result != JQ_OK) {
+            return check_result;
+        }
+        if (present) {
+            *state_out = states[i];
+            *locked_out = 0;
+            return JQ_OK;
+        }
+
+        char pdf_locked[PATH_MAX];
+        char metadata_locked[PATH_MAX];
+        jq_result_t locked_result =
+            jq_job_paths_locked(root_path, uuid, states[i], pdf_locked, sizeof(pdf_locked),
+                                metadata_locked, sizeof(metadata_locked));
+        if (locked_result != JQ_OK) {
+            return locked_result;
+        }
+
+        present = 0;
+        check_result = jq_check_pair_exists(pdf_locked, metadata_locked, &present);
+        if (check_result != JQ_OK) {
+            return check_result;
+        }
+        if (present) {
+            *state_out = states[i];
+            *locked_out = 1;
+            return JQ_OK;
+        }
+    }
+
+    return JQ_ERR_NOT_FOUND;
 }
 
 static int jq_has_suffix(const char *name, const char *suffix) {
