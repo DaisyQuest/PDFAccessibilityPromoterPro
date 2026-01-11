@@ -25,6 +25,38 @@ static int write_file(const char *path, const char *contents) {
     return 1;
 }
 
+static int write_buffer(const char *path, const char *contents, size_t length) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return 0;
+    }
+    if (fwrite(contents, 1, length, fp) != length) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+    return 1;
+}
+
+static int append_text(char *buffer, size_t buffer_len, size_t *offset, const char *text) {
+    size_t length = strlen(text);
+    if (*offset + length >= buffer_len) {
+        return 0;
+    }
+    memcpy(buffer + *offset, text, length);
+    *offset += length;
+    return 1;
+}
+
+static int append_padding(char *buffer, size_t buffer_len, size_t *offset, size_t count, char fill) {
+    if (*offset + count >= buffer_len) {
+        return 0;
+    }
+    memset(buffer + *offset, fill, count);
+    *offset += count;
+    return 1;
+}
+
 static int test_report_init_invalid(void) {
     return assert_true(pdfa_report_init(NULL) == PDFA_ERR_INVALID_ARGUMENT,
                        "pdfa_report_init should reject NULL");
@@ -386,6 +418,150 @@ static int test_analyze_lang_requires_value(void) {
            assert_true(has_missing_lang, "missing lang issue");
 }
 
+static int test_analyze_chunk_boundary_values(void) {
+    char template[] = "/tmp/pap_pdfa_boundary_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/boundary.pdf", root);
+
+    size_t buffer_len = (size_t)PDFA_SCAN_CHUNK_SIZE * 2 + 512;
+    char *buffer = calloc(buffer_len, 1);
+    if (!buffer) {
+        perror("calloc failed");
+        return 0;
+    }
+
+    size_t offset = 0;
+    size_t boundary1 = (size_t)PDFA_SCAN_CHUNK_SIZE - 5;
+    size_t boundary2 = (size_t)PDFA_SCAN_CHUNK_SIZE * 2 - 7;
+    if (offset >= boundary1 || boundary1 >= buffer_len || boundary2 >= buffer_len) {
+        free(buffer);
+        return assert_true(0, "invalid boundary offsets");
+    }
+    if (!append_text(buffer, buffer_len, &offset,
+                     "%PDF-1.7\n"
+                     "<< /Type /Catalog /Pages /Outlines /StructTreeRoot ") ||
+        !append_padding(buffer, buffer_len, &offset, boundary1 - offset, 'A') ||
+        !append_text(buffer, buffer_len, &offset, "/Lang") ||
+        !append_text(buffer, buffer_len, &offset, " (en-US) ") ||
+        !append_padding(buffer, buffer_len, &offset, boundary2 - offset, 'B') ||
+        !append_text(buffer, buffer_len, &offset, "/Marked") ||
+        !append_text(buffer, buffer_len, &offset,
+                     " true /DisplayDocTitle true /Title (Advanced PDF) "
+                     "/Alt (Alt text) /ActualText (Actual text) "
+                     "/RoleMap <<>> /Metadata 5 0 R >>\n"
+                     "<< /MarkInfo << /Marked true >> "
+                     "/ViewerPreferences << /DisplayDocTitle true >> "
+                     "/ParentTree 6 0 R >>\n"
+                     "<< /StructParents 2 /MCID 7 >>\n")) {
+        free(buffer);
+        return assert_true(0, "failed to build chunk boundary buffer");
+    }
+
+    if (!assert_true(write_buffer(path, buffer, offset), "write boundary pdf")) {
+        free(buffer);
+        return 0;
+    }
+    free(buffer);
+
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(path, &report) == PDFA_OK, "analyze boundary pdf")) {
+        return 0;
+    }
+
+    return assert_true(report.has_lang, "boundary lang present") &&
+           assert_true(report.has_marked_content, "boundary marked content present") &&
+           assert_true(report.has_display_doc_title, "boundary display doc title present") &&
+           assert_true(report.has_title, "boundary title present") &&
+           assert_true(report.has_alt_text, "boundary alt text present") &&
+           assert_true(report.has_actual_text, "boundary actual text present") &&
+           assert_true(report.has_role_map, "boundary role map present") &&
+           assert_true(report.has_metadata, "boundary metadata present") &&
+           assert_true(report.has_mark_info, "boundary mark info present") &&
+           assert_true(report.has_viewer_preferences, "boundary viewer preferences present") &&
+           assert_true(report.has_parent_tree, "boundary parent tree present") &&
+           assert_true(report.has_struct_parents, "boundary struct parents present") &&
+           assert_true(report.has_mcid, "boundary mcid present") &&
+           assert_true(report.issue_count == 0, "boundary has no issues");
+}
+
+static int test_analyze_fixture_pdfs(void) {
+    const char *missing_path = "tests/fixtures/problem_document.pdf";
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(missing_path, &report) == PDFA_OK,
+                     "analyze fixture missing pdf")) {
+        return 0;
+    }
+
+    int has_missing_outlines = 0;
+    int has_missing_tags = 0;
+    int has_missing_lang = 0;
+    int has_missing_title = 0;
+    int has_missing_alt = 0;
+    for (size_t i = 0; i < report.issue_count; ++i) {
+        switch (report.issues[i]) {
+            case PDFA_ISSUE_MISSING_OUTLINES:
+                has_missing_outlines = 1;
+                break;
+            case PDFA_ISSUE_MISSING_TAGS:
+                has_missing_tags = 1;
+                break;
+            case PDFA_ISSUE_MISSING_LANGUAGE:
+                has_missing_lang = 1;
+                break;
+            case PDFA_ISSUE_MISSING_TITLE:
+                has_missing_title = 1;
+                break;
+            case PDFA_ISSUE_MISSING_TEXT_ALTERNATIVES:
+                has_missing_alt = 1;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!assert_true(report.has_catalog, "fixture missing catalog present") ||
+        !assert_true(report.has_pages, "fixture missing pages present") ||
+        !assert_true(has_missing_outlines, "fixture missing outlines issue") ||
+        !assert_true(has_missing_tags, "fixture missing tags issue") ||
+        !assert_true(has_missing_lang, "fixture missing language issue") ||
+        !assert_true(has_missing_title, "fixture missing title issue") ||
+        !assert_true(has_missing_alt, "fixture missing alt issue")) {
+        return 0;
+    }
+
+    const char *fixed_path = "tests/fixtures/fixed_document.pdf";
+    if (!assert_true(pdfa_analyze_file(fixed_path, &report) == PDFA_OK,
+                     "analyze fixture fixed pdf")) {
+        return 0;
+    }
+
+    return assert_true(report.pdf_version_major == 1 && report.pdf_version_minor == 7,
+                       "fixture fixed version parsed") &&
+           assert_true(report.has_catalog, "fixture fixed catalog present") &&
+           assert_true(report.has_pages, "fixture fixed pages present") &&
+           assert_true(report.has_outlines, "fixture fixed outlines present") &&
+           assert_true(report.has_struct_tree_root, "fixture fixed tags present") &&
+           assert_true(report.has_lang, "fixture fixed lang present") &&
+           assert_true(report.has_alt_text, "fixture fixed alt text present") &&
+           assert_true(report.has_actual_text, "fixture fixed actual text present") &&
+           assert_true(report.has_title, "fixture fixed title present") &&
+           assert_true(report.has_marked_content, "fixture fixed marked content present") &&
+           assert_true(report.has_display_doc_title, "fixture fixed display doc title present") &&
+           assert_true(report.has_role_map, "fixture fixed role map present") &&
+           assert_true(report.has_metadata, "fixture fixed metadata present") &&
+           assert_true(report.has_mark_info, "fixture fixed mark info present") &&
+           assert_true(report.has_viewer_preferences, "fixture fixed viewer preferences present") &&
+           assert_true(report.has_parent_tree, "fixture fixed parent tree present") &&
+           assert_true(report.has_struct_parents, "fixture fixed struct parents present") &&
+           assert_true(report.has_mcid, "fixture fixed mcid present") &&
+           assert_true(report.issue_count == 0, "fixture fixed has no issues");
+}
+
 static int test_json_invalid_args(void) {
     char buffer[32];
     pdfa_report_t report;
@@ -472,6 +648,73 @@ static int test_json_success(void) {
            assert_true(written == strlen(buffer), "written matches length");
 }
 
+static int test_html_invalid_args(void) {
+    char buffer[128];
+    pdfa_report_t report;
+    pdfa_report_init(&report);
+    return assert_true(pdfa_report_to_html(NULL, "before.pdf", "after.pdf", buffer, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "html should reject NULL report") &&
+           assert_true(pdfa_report_to_html(&report, NULL, "after.pdf", buffer, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "html should reject NULL before link") &&
+           assert_true(pdfa_report_to_html(&report, "before.pdf", NULL, buffer, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "html should reject NULL after link") &&
+           assert_true(pdfa_report_to_html(&report, "before.pdf", "after.pdf", NULL, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "html should reject NULL buffer") &&
+           assert_true(pdfa_report_to_html(&report, "before.pdf", "after.pdf", buffer, 0, NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "html should reject zero buffer");
+}
+
+static int test_html_buffer_too_small(void) {
+    pdfa_report_t report;
+    pdfa_report_init(&report);
+    report.pdf_version_major = 1;
+    report.pdf_version_minor = 7;
+    char buffer[16];
+    return assert_true(pdfa_report_to_html(&report,
+                                           "before.pdf",
+                                           "after.pdf",
+                                           buffer,
+                                           sizeof(buffer),
+                                           NULL) == PDFA_ERR_BUFFER_TOO_SMALL,
+                       "html should report buffer too small");
+}
+
+static int test_html_success(void) {
+    const char *fixed_path = "tests/fixtures/fixed_document.pdf";
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(fixed_path, &report) == PDFA_OK, "analyze for html success")) {
+        return 0;
+    }
+
+    char buffer[4096];
+    size_t written = 0;
+    if (!assert_true(pdfa_report_to_html(&report,
+                                         "tests/fixtures/problem_document.pdf",
+                                         "tests/fixtures/fixed_document.pdf",
+                                         buffer,
+                                         sizeof(buffer),
+                                         &written) == PDFA_OK,
+                     "html should succeed")) {
+        return 0;
+    }
+
+    return assert_true(strstr(buffer, "<!doctype html>") != NULL, "html includes doctype") &&
+           assert_true(strstr(buffer, "Accessibility Transformation Report") != NULL,
+                       "html includes report title") &&
+           assert_true(strstr(buffer, "Before PDF") != NULL, "html includes before link text") &&
+           assert_true(strstr(buffer, "After PDF") != NULL, "html includes after link text") &&
+           assert_true(strstr(buffer, "tests/fixtures/problem_document.pdf") != NULL,
+                       "html includes before link href") &&
+           assert_true(strstr(buffer, "tests/fixtures/fixed_document.pdf") != NULL,
+                       "html includes after link href") &&
+           assert_true(written == strlen(buffer), "html written matches length");
+}
+
 static int test_result_str(void) {
     return assert_true(strcmp(pdfa_result_str(PDFA_OK), "ok") == 0, "result ok") &&
            assert_true(strcmp(pdfa_result_str(PDFA_ERR_INVALID_ARGUMENT), "invalid_argument") == 0,
@@ -497,9 +740,14 @@ int main(void) {
     ok &= test_analyze_missing_mcid();
     ok &= test_analyze_text_alternatives_variants();
     ok &= test_analyze_lang_requires_value();
+    ok &= test_analyze_chunk_boundary_values();
+    ok &= test_analyze_fixture_pdfs();
     ok &= test_json_invalid_args();
     ok &= test_json_buffer_too_small();
     ok &= test_json_success();
+    ok &= test_html_invalid_args();
+    ok &= test_html_buffer_too_small();
+    ok &= test_html_success();
     ok &= test_result_str();
 
     if (ok) {
