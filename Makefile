@@ -62,6 +62,8 @@ test: $(TEST_BIN) $(PDF_TEST_BIN) $(CLI_BIN) $(CLI_TEST_BIN) $(HTTP_BIN) $(HTTP_
 	./$(HTTP_TEST_BIN)
 	./$(HTTP_UNIT_TEST_BIN)
 	sh tests/integration_http.sh
+	sh tests/test_docs.sh
+	sh tests/test_html_report.sh
 
 clean:
 	rm -f $(LIB_OBJECTS) $(CLI_OBJECTS) $(HTTP_OBJECTS) $(TEST_OBJECTS) $(CLI_TEST_OBJECTS) \

@@ -69,6 +69,12 @@ pdfa_result_t pdfa_report_to_json(const pdfa_report_t *report,
                                   char *buffer,
                                   size_t buffer_len,
                                   size_t *written_out);
+pdfa_result_t pdfa_report_to_html(const pdfa_report_t *report,
+                                  const char *before_link,
+                                  const char *after_link,
+                                  char *buffer,
+                                  size_t buffer_len,
+                                  size_t *written_out);
 const char *pdfa_result_str(pdfa_result_t result);
 
 #ifdef __cplusplus

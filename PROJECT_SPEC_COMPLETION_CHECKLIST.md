@@ -7,6 +7,7 @@
 - [ ] Accessibility processing requirements confirmed.
 - [ ] Performance requirements confirmed for 5GB+ PDFs.
 - [ ] API contract finalized.
+- [x] Accessibility transformations documentation created.
 
 ## Core Architecture
 - [ ] Job queue server core implemented.
