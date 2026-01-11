@@ -224,6 +224,102 @@ static int test_apply_boundary_redaction(void) {
            assert_true(report.bytes_redacted == 6, "bytes redacted");
 }
 
+static int test_apply_pii_redaction(void) {
+    char template[] = "/tmp/pap_redact_pii_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    snprintf(input, sizeof(input), "%s/input.pdf", root);
+    snprintf(output, sizeof(output), "%s/output.pdf", root);
+
+    const char *contents =
+        "%PDF-1.7\n"
+        "SSN 123-45-6789\n"
+        "SSN 123456789\n"
+        "SSN 6789\n"
+        "NINO AB 12 34 56 C\n"
+        "SIN 046 454 286\n"
+        "AADHAAR 1000 0000 0004\n";
+    if (!assert_true(write_buffer(input, contents, strlen(contents)), "write pii pdf")) {
+        return 0;
+    }
+
+    pdrx_plan_t plan;
+    pdrx_report_t report;
+    pdrx_plan_init(&plan);
+    if (!assert_true(pdrx_apply_file(input, output, &plan, &report) == PDRX_OK,
+                     "apply pii redaction")) {
+        return 0;
+    }
+
+    char output_buffer[512];
+    if (!assert_true(read_file(output, output_buffer, sizeof(output_buffer)), "read pii output")) {
+        return 0;
+    }
+
+    return assert_true(strstr(output_buffer, "SSN XXXXXXXXXXX") != NULL, "redact ssn dashed") &&
+           assert_true(strstr(output_buffer, "SSN XXXXXXXXX") != NULL, "redact ssn compact") &&
+           assert_true(strstr(output_buffer, "SSN XXXX") != NULL, "redact ssn last4") &&
+           assert_true(strstr(output_buffer, "NINO XXXXXXXXXXXXX") != NULL, "redact nino") &&
+           assert_true(strstr(output_buffer, "SIN XXXXXXXXXXX") != NULL, "redact sin") &&
+           assert_true(strstr(output_buffer, "AADHAAR XXXXXXXXXXXXXX") != NULL, "redact aadhaar") &&
+           assert_true(report.match_count == 6, "pii match count") &&
+           assert_true(report.bytes_redacted == 62, "pii bytes redacted");
+}
+
+static int test_apply_pii_invalid(void) {
+    char template[] = "/tmp/pap_redact_pii_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char input[PATH_MAX];
+    char output[PATH_MAX];
+    snprintf(input, sizeof(input), "%s/input.pdf", root);
+    snprintf(output, sizeof(output), "%s/output.pdf", root);
+
+    const char *contents =
+        "%PDF-1.7\n"
+        "SSN 000-12-3456\n"
+        "SSN 123-00-6789\n"
+        "SSN 123-45-0000\n"
+        "SSN 1234567890\n"
+        "SIN 123 456 789\n"
+        "AADHAAR 1000 0000 0000\n"
+        "NINO DQ 12 34 56 C\n";
+    if (!assert_true(write_buffer(input, contents, strlen(contents)), "write pii invalid pdf")) {
+        return 0;
+    }
+
+    pdrx_plan_t plan;
+    pdrx_report_t report;
+    pdrx_plan_init(&plan);
+    if (!assert_true(pdrx_apply_file(input, output, &plan, &report) == PDRX_OK,
+                     "apply pii invalid redaction")) {
+        return 0;
+    }
+
+    char output_buffer[512];
+    if (!assert_true(read_file(output, output_buffer, sizeof(output_buffer)), "read pii invalid output")) {
+        return 0;
+    }
+
+    return assert_true(strstr(output_buffer, "SSN 000-12-3456") != NULL, "invalid ssn area preserved") &&
+           assert_true(strstr(output_buffer, "SSN 123-00-6789") != NULL, "invalid ssn group preserved") &&
+           assert_true(strstr(output_buffer, "SSN 123-45-0000") != NULL, "invalid ssn serial preserved") &&
+           assert_true(strstr(output_buffer, "SSN 1234567890") != NULL, "invalid ssn length preserved") &&
+           assert_true(strstr(output_buffer, "SIN 123 456 789") != NULL, "invalid sin preserved") &&
+           assert_true(strstr(output_buffer, "AADHAAR 1000 0000 0000") != NULL, "invalid aadhaar preserved") &&
+           assert_true(strstr(output_buffer, "NINO DQ 12 34 56 C") != NULL, "invalid nino preserved") &&
+           assert_true(report.match_count == 0, "invalid pii match count") &&
+           assert_true(report.bytes_redacted == 0, "invalid pii bytes redacted");
+}
+
 static int test_report_to_json(void) {
     pdrx_report_t report;
     pdrx_plan_t plan;
@@ -290,6 +386,8 @@ int main(void) {
     passed &= test_apply_missing_file();
     passed &= test_apply_empty_plan();
     passed &= test_apply_boundary_redaction();
+    passed &= test_apply_pii_redaction();
+    passed &= test_apply_pii_invalid();
     passed &= test_report_to_json();
     passed &= test_report_to_json_success();
     passed &= test_result_str();

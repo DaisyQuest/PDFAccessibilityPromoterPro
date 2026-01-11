@@ -53,6 +53,7 @@
 ## Testing & Coverage
 - [x] Unit tests complete.
 - [x] Integration tests complete.
+- [x] Redaction PII detection test coverage added.
 - [ ] System tests complete.
 - [ ] Coverage ≥ 90% achieved.
 - [ ] Full branch coverage documented.
