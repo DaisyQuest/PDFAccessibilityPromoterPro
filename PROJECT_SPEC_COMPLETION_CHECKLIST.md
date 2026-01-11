@@ -40,7 +40,7 @@
 ## Reliability & Safety
 - [ ] Atomic job transitions verified.
 - [ ] Error handling and recovery tested.
-- [ ] Audit logging in place.
+- [x] Audit logging in place.
 
 ## Testing & Coverage
 - [ ] Unit tests complete.

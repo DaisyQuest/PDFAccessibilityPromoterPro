@@ -76,7 +76,7 @@ static int wait_for_port_open(int port) {
     return 0;
 }
 
-static int start_server(const char *root, int port, pid_t *pid_out) {
+static int start_server(const char *root, int port, const char *token, pid_t *pid_out) {
     pid_t pid = fork();
     if (pid < 0) {
         return 0;
@@ -84,7 +84,17 @@ static int start_server(const char *root, int port, pid_t *pid_out) {
     if (pid == 0) {
         char port_arg[16];
         snprintf(port_arg, sizeof(port_arg), "%d", port);
-        execl("./job_queue_http", "job_queue_http", root, port_arg, (char *)NULL);
+        const char *args[8];
+        int idx = 0;
+        args[idx++] = "./job_queue_http";
+        args[idx++] = root;
+        args[idx++] = port_arg;
+        if (token) {
+            args[idx++] = "--token";
+            args[idx++] = token;
+        }
+        args[idx] = NULL;
+        execv("./job_queue_http", (char *const *)args);
         _exit(1);
     }
 
@@ -112,10 +122,12 @@ static int test_http_submit_claim_finalize(void) {
         return 0;
     }
 
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
     char pdf_src[PATH_MAX];
     char metadata_src[PATH_MAX];
-    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
-    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
     if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf")) {
         return 0;
     }
@@ -125,7 +137,7 @@ static int test_http_submit_claim_finalize(void) {
 
     pid_t pid = 0;
     int port = 9099;
-    if (!assert_true(start_server(root, port, &pid), "start server")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server")) {
         return 0;
     }
 
@@ -134,7 +146,7 @@ static int test_http_submit_claim_finalize(void) {
     snprintf(command, sizeof(command),
              "curl -s -w \"%s\" -o /dev/null "
              "'http://127.0.0.1:%d/submit?uuid=http-job&pdf=%s&metadata=%s'",
-             "%{http_code}", port, pdf_src, metadata_src);
+             "%{http_code}", port, pdf_rel, metadata_rel);
     if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit request")) {
         stop_server(pid);
         return 0;
@@ -205,10 +217,12 @@ static int test_http_release_and_errors(void) {
         return 0;
     }
 
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
     char pdf_src[PATH_MAX];
     char metadata_src[PATH_MAX];
-    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
-    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
     if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf")) {
         return 0;
     }
@@ -222,7 +236,7 @@ static int test_http_release_and_errors(void) {
 
     pid_t pid = 0;
     int port = 9100;
-    if (!assert_true(start_server(root, port, &pid), "start server")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server")) {
         return 0;
     }
 
@@ -286,7 +300,7 @@ static int test_http_invalid_method_and_not_found(void) {
 
     pid_t pid = 0;
     int port = 9101;
-    if (!assert_true(start_server(root, port, &pid), "start server")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server")) {
         return 0;
     }
 
@@ -336,7 +350,7 @@ static int test_http_missing_params(void) {
 
     pid_t pid = 0;
     int port = 9102;
-    if (!assert_true(start_server(root, port, &pid), "start server")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server")) {
         return 0;
     }
 
@@ -371,15 +385,16 @@ static int test_http_submit_missing_file(void) {
         return 0;
     }
 
+    const char *metadata_rel = "source.metadata";
     char metadata_src[PATH_MAX];
-    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
     if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for missing submit")) {
         return 0;
     }
 
     pid_t pid = 0;
     int port = 9105;
-    if (!assert_true(start_server(root, port, &pid), "start server for submit missing")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for submit missing")) {
         return 0;
     }
 
@@ -388,7 +403,7 @@ static int test_http_submit_missing_file(void) {
     snprintf(command, sizeof(command),
              "curl -s -w \"%s\" -o /dev/null "
              "'http://127.0.0.1:%d/submit?uuid=missing-file&pdf=%s&metadata=%s'",
-             "%{http_code}", port, "/tmp/does-not-exist.pdf", metadata_src);
+             "%{http_code}", port, "missing.pdf", metadata_rel);
     if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit missing file")) {
         stop_server(pid);
         return 0;
@@ -417,7 +432,7 @@ static int test_http_claim_empty(void) {
 
     pid_t pid = 0;
     int port = 9103;
-    if (!assert_true(start_server(root, port, &pid), "start server")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server")) {
         return 0;
     }
 
@@ -452,10 +467,12 @@ static int test_http_move_endpoint(void) {
         return 0;
     }
 
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
     char pdf_src[PATH_MAX];
     char metadata_src[PATH_MAX];
-    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
-    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
     if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for move")) {
         return 0;
     }
@@ -465,7 +482,7 @@ static int test_http_move_endpoint(void) {
 
     pid_t pid = 0;
     int port = 9106;
-    if (!assert_true(start_server(root, port, &pid), "start server for move")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for move")) {
         return 0;
     }
 
@@ -474,7 +491,7 @@ static int test_http_move_endpoint(void) {
     snprintf(command, sizeof(command),
              "curl -s -w \"%s\" -o /dev/null "
              "'http://127.0.0.1:%d/submit?uuid=move-job&pdf=%s&metadata=%s'",
-             "%{http_code}", port, pdf_src, metadata_src);
+             "%{http_code}", port, pdf_rel, metadata_rel);
     if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit move job")) {
         stop_server(pid);
         return 0;
@@ -532,7 +549,7 @@ static int test_http_status_missing_uuid(void) {
 
     pid_t pid = 0;
     int port = 9107;
-    if (!assert_true(start_server(root, port, &pid), "start server for status missing")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for status missing")) {
         return 0;
     }
 
@@ -568,7 +585,7 @@ static int test_http_retrieve_invalid_kind(void) {
 
     pid_t pid = 0;
     int port = 9108;
-    if (!assert_true(start_server(root, port, &pid), "start server for retrieve invalid")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for retrieve invalid")) {
         return 0;
     }
 
@@ -605,7 +622,7 @@ static int test_http_retrieve_not_found(void) {
 
     pid_t pid = 0;
     int port = 9109;
-    if (!assert_true(start_server(root, port, &pid), "start server for retrieve missing")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for retrieve missing")) {
         return 0;
     }
 
@@ -642,7 +659,7 @@ static int test_http_move_invalid_state(void) {
 
     pid_t pid = 0;
     int port = 9110;
-    if (!assert_true(start_server(root, port, &pid), "start server for move invalid")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for move invalid")) {
         return 0;
     }
 
@@ -679,7 +696,7 @@ static int test_http_finalize_missing_job(void) {
 
     pid_t pid = 0;
     int port = 9111;
-    if (!assert_true(start_server(root, port, &pid), "start server for finalize missing")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for finalize missing")) {
         return 0;
     }
 
@@ -716,7 +733,7 @@ static int test_http_release_missing_job(void) {
 
     pid_t pid = 0;
     int port = 9112;
-    if (!assert_true(start_server(root, port, &pid), "start server for release missing")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for release missing")) {
         return 0;
     }
 
@@ -751,10 +768,12 @@ static int test_http_status_and_retrieve(void) {
         return 0;
     }
 
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
     char pdf_src[PATH_MAX];
     char metadata_src[PATH_MAX];
-    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
-    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
     if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for status")) {
         return 0;
     }
@@ -764,7 +783,7 @@ static int test_http_status_and_retrieve(void) {
 
     pid_t pid = 0;
     int port = 9104;
-    if (!assert_true(start_server(root, port, &pid), "start server for status")) {
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for status")) {
         return 0;
     }
 
@@ -773,7 +792,7 @@ static int test_http_status_and_retrieve(void) {
     snprintf(command, sizeof(command),
              "curl -s -w \"%s\" -o /dev/null "
              "'http://127.0.0.1:%d/submit?uuid=status-job&pdf=%s&metadata=%s'",
-             "%{http_code}", port, pdf_src, metadata_src);
+             "%{http_code}", port, pdf_rel, metadata_rel);
     if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit status job")) {
         stop_server(pid);
         return 0;
@@ -861,6 +880,180 @@ static int test_http_status_and_retrieve(void) {
     return 1;
 }
 
+static int test_http_auth_token(void) {
+    char template[] = "/tmp/pap_test_http_auth_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for auth")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9113;
+    const char *token = "secret-token";
+    if (!assert_true(start_server(root, port, token, &pid), "start server for auth")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null http://127.0.0.1:%d/health",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "health without token")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "health no token 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null http://127.0.0.1:%d/claim",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "claim without token")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "401") != NULL, "claim without token 401")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null 'http://127.0.0.1:%d/claim?token=%s'",
+             "%{http_code}", port, token);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "claim with token")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "404") != NULL, "claim with token 404")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_url_decoding(void) {
+    char template[] = "/tmp/pap_test_http_decode_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for decode")) {
+        return 0;
+    }
+
+    const char *pdf_rel = "spaced file.pdf";
+    const char *metadata_rel = "spaced file.metadata";
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for decode")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for decode")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9114;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for decode")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=decode-job&pdf=spaced+file.pdf&metadata=spaced+file.metadata'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit decode")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "submit decode 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_invalid_uuid_and_path(void) {
+    char template[] = "/tmp/pap_test_http_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for invalid")) {
+        return 0;
+    }
+
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for invalid")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for invalid")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9115;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for invalid")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=bad%%20uuid&pdf=%s&metadata=%s'",
+             "%{http_code}", port, pdf_rel, metadata_rel);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit invalid uuid")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "400") != NULL, "invalid uuid 400")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=ok-uuid&pdf=../escape.pdf&metadata=%s'",
+             "%{http_code}", port, metadata_rel);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit invalid path")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "400") != NULL, "invalid path 400")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_http_submit_claim_finalize();
@@ -877,6 +1070,9 @@ int main(void) {
     passed &= test_http_finalize_missing_job();
     passed &= test_http_release_missing_job();
     passed &= test_http_status_and_retrieve();
+    passed &= test_http_auth_token();
+    passed &= test_http_url_decoding();
+    passed &= test_http_invalid_uuid_and_path();
 
     if (!passed) {
         fprintf(stderr, "Some HTTP tests failed.\n");
