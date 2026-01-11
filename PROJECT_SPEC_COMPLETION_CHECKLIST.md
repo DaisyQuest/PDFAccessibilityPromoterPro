@@ -41,13 +41,13 @@
 - [ ] Result retrieval UI connected.
 
 ## Reliability & Safety
-- [ ] Atomic job transitions verified.
-- [ ] Error handling and recovery tested.
+- [x] Atomic job transitions verified.
+- [x] Error handling and recovery tested.
 - [x] Audit logging in place.
 
 ## Testing & Coverage
-- [ ] Unit tests complete.
-- [ ] Integration tests complete.
+- [x] Unit tests complete.
+- [x] Integration tests complete.
 - [ ] System tests complete.
 - [ ] Coverage ≥ 90% achieved.
 - [ ] Full branch coverage documented.

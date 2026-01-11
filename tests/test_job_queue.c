@@ -782,6 +782,110 @@ static int test_release_and_finalize(void) {
     return 1;
 }
 
+static int test_release_rolls_back_on_missing_metadata(void) {
+    char template[] = "/tmp/pap_test_release_partial_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for release partial")) {
+        return 0;
+    }
+
+    char pdf_locked[PATH_MAX];
+    char metadata_locked[PATH_MAX];
+    if (!assert_true(build_locked_paths(root, "job-partial", "jobs",
+                                        pdf_locked, sizeof(pdf_locked),
+                                        metadata_locked, sizeof(metadata_locked)),
+                     "build locked paths for release partial")) {
+        return 0;
+    }
+
+    if (!assert_true(write_file(pdf_locked, "pdf data"), "write locked pdf")) {
+        return 0;
+    }
+
+    jq_result_t release_result = jq_release(root, "job-partial", JQ_STATE_JOBS);
+    if (!assert_true(release_result == JQ_ERR_NOT_FOUND, "release missing metadata returns not found")) {
+        return 0;
+    }
+
+    char pdf_dest[PATH_MAX];
+    char metadata_dest[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-partial", JQ_STATE_JOBS,
+                                  pdf_dest, sizeof(pdf_dest),
+                                  metadata_dest, sizeof(metadata_dest)) == JQ_OK,
+                     "job paths after release partial")) {
+        return 0;
+    }
+
+    if (!assert_true(file_exists(pdf_locked), "locked pdf restored after release failure")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(pdf_dest), "unlocked pdf not left behind")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(metadata_dest), "metadata not created on release failure")) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int test_finalize_rolls_back_on_missing_metadata(void) {
+    char template[] = "/tmp/pap_test_finalize_partial_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for finalize partial")) {
+        return 0;
+    }
+
+    char pdf_locked[PATH_MAX];
+    char metadata_locked[PATH_MAX];
+    if (!assert_true(build_locked_paths(root, "job-finalize", "jobs",
+                                        pdf_locked, sizeof(pdf_locked),
+                                        metadata_locked, sizeof(metadata_locked)),
+                     "build locked paths for finalize partial")) {
+        return 0;
+    }
+
+    if (!assert_true(write_file(pdf_locked, "pdf data"), "write locked pdf for finalize")) {
+        return 0;
+    }
+
+    jq_result_t finalize_result = jq_finalize(root, "job-finalize", JQ_STATE_JOBS, JQ_STATE_COMPLETE);
+    if (!assert_true(finalize_result == JQ_ERR_NOT_FOUND, "finalize missing metadata returns not found")) {
+        return 0;
+    }
+
+    char pdf_complete[PATH_MAX];
+    char metadata_complete[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-finalize", JQ_STATE_COMPLETE,
+                                  pdf_complete, sizeof(pdf_complete),
+                                  metadata_complete, sizeof(metadata_complete)) == JQ_OK,
+                     "complete paths after finalize partial")) {
+        return 0;
+    }
+
+    if (!assert_true(file_exists(pdf_locked), "locked pdf restored after finalize failure")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(pdf_complete), "complete pdf not left behind")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(metadata_complete), "metadata not created on finalize failure")) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static int test_claim_invalid_args(void) {
     char uuid[8];
     jq_state_t state = JQ_STATE_JOBS;
@@ -1000,6 +1104,30 @@ static int test_status_partial_pair(void) {
                        "status partial pair returns io error");
 }
 
+static int test_status_metadata_only(void) {
+    char template[] = "/tmp/pap_test_status_meta_only_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for status metadata only")) {
+        return 0;
+    }
+
+    char orphan_metadata[PATH_MAX];
+    snprintf(orphan_metadata, sizeof(orphan_metadata), "%s/jobs/partial.metadata.job", root);
+    if (!assert_true(write_file(orphan_metadata, "metadata"), "write partial metadata")) {
+        return 0;
+    }
+
+    jq_state_t state = JQ_STATE_JOBS;
+    int locked = 0;
+    return assert_true(jq_status(root, "partial", &state, &locked) == JQ_ERR_IO,
+                       "status metadata-only returns io error");
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_init_invalid();
@@ -1021,6 +1149,7 @@ int main(void) {
     passed &= test_claim_priority();
     passed &= test_claim_no_jobs();
     passed &= test_release_and_finalize();
+    passed &= test_release_rolls_back_on_missing_metadata();
     passed &= test_claim_invalid_args();
     passed &= test_claim_skips_orphan();
     passed &= test_release_invalid_args();
@@ -1033,6 +1162,8 @@ int main(void) {
     passed &= test_status_unlocked_and_locked();
     passed &= test_status_not_found();
     passed &= test_status_partial_pair();
+    passed &= test_finalize_rolls_back_on_missing_metadata();
+    passed &= test_status_metadata_only();
 
     if (!passed) {
         fprintf(stderr, "Some tests failed.\n");
