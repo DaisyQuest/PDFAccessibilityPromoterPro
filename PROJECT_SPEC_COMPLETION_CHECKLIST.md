@@ -27,8 +27,8 @@
 
 ## API
 - [x] Job submission API implemented.
-- [ ] Job status API implemented.
-- [ ] Job retrieval API implemented.
+- [x] Job status API implemented.
+- [x] Job retrieval API implemented.
 - [x] Worker coordination endpoints implemented.
 
 ## Client Manager

@@ -53,6 +53,11 @@ jq_result_t jq_finalize(const char *root_path,
                         jq_state_t from_state,
                         jq_state_t to_state);
 
+jq_result_t jq_status(const char *root_path,
+                      const char *uuid,
+                      jq_state_t *state_out,
+                      int *locked_out);
+
 jq_result_t jq_job_paths(const char *root_path,
                          const char *uuid,
                          jq_state_t state,

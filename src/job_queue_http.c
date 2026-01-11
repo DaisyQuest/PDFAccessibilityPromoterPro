@@ -2,11 +2,13 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -43,6 +45,47 @@ static int send_response(int client_fd, int status, const char *status_text, con
         return 0;
     }
     return write_all(client_fd, response, (size_t)written);
+}
+
+static int send_file(int client_fd, const char *content_type, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
+
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        return 0;
+    }
+
+    char header[HTTP_BUFFER_SIZE];
+    int written = snprintf(header, sizeof(header),
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: %s\r\n"
+                           "Content-Length: %ld\r\n"
+                           "Connection: close\r\n\r\n",
+                           content_type, (long)st.st_size);
+    if (written < 0 || (size_t)written >= sizeof(header)) {
+        close(file_fd);
+        return 0;
+    }
+
+    if (!write_all(client_fd, header, (size_t)written)) {
+        close(file_fd);
+        return 0;
+    }
+
+    char buffer[HTTP_BUFFER_SIZE];
+    ssize_t bytes_read;
+    while ((bytes_read = read(file_fd, buffer, sizeof(buffer))) > 0) {
+        if (!write_all(client_fd, buffer, (size_t)bytes_read)) {
+            close(file_fd);
+            return 0;
+        }
+    }
+
+    close(file_fd);
+    return bytes_read >= 0;
 }
 
 static int parse_first_line(const char *request, char *method, size_t method_len, char *path, size_t path_len) {
@@ -299,6 +342,81 @@ static int handle_move(const char *root, const char *query, int client_fd) {
     return send_response(client_fd, 500, "Internal Server Error", "io error\n");
 }
 
+static int handle_status(const char *root, const char *query, int client_fd) {
+    char uuid[HTTP_UUID_SIZE];
+    if (!get_query_param(query, "uuid", uuid, sizeof(uuid))) {
+        return send_response(client_fd, 400, "Bad Request", "missing parameters\n");
+    }
+
+    jq_state_t state = JQ_STATE_JOBS;
+    int locked = 0;
+    jq_result_t result = jq_status(root, uuid, &state, &locked);
+    if (result == JQ_OK) {
+        char body[HTTP_BUFFER_SIZE];
+        int written = snprintf(body, sizeof(body), "state=%s locked=%d\n", state_to_string(state), locked);
+        if (written < 0 || (size_t)written >= sizeof(body)) {
+            return send_response(client_fd, 500, "Internal Server Error", "response too large");
+        }
+        return send_response(client_fd, 200, "OK", body);
+    }
+
+    if (result == JQ_ERR_NOT_FOUND) {
+        return send_response(client_fd, 404, "Not Found", "job not found\n");
+    }
+
+    if (result == JQ_ERR_INVALID_ARGUMENT) {
+        return send_response(client_fd, 400, "Bad Request", "invalid arguments\n");
+    }
+
+    return send_response(client_fd, 500, "Internal Server Error", "io error\n");
+}
+
+static int handle_retrieve(const char *root, const char *query, int client_fd) {
+    char uuid[HTTP_UUID_SIZE];
+    char state_value[32];
+    char kind_value[32];
+    if (!get_query_param(query, "uuid", uuid, sizeof(uuid)) ||
+        !get_query_param(query, "state", state_value, sizeof(state_value)) ||
+        !get_query_param(query, "kind", kind_value, sizeof(kind_value))) {
+        return send_response(client_fd, 400, "Bad Request", "missing parameters\n");
+    }
+
+    jq_state_t state;
+    if (!parse_state(state_value, &state)) {
+        return send_response(client_fd, 400, "Bad Request", "invalid state\n");
+    }
+
+    int send_pdf = strcmp(kind_value, "pdf") == 0;
+    int send_metadata = strcmp(kind_value, "metadata") == 0;
+    if (!send_pdf && !send_metadata) {
+        return send_response(client_fd, 400, "Bad Request", "invalid kind\n");
+    }
+
+    char pdf_path[HTTP_PATH_SIZE];
+    char metadata_path[HTTP_PATH_SIZE];
+    jq_result_t path_result =
+        jq_job_paths(root, uuid, state, pdf_path, sizeof(pdf_path), metadata_path, sizeof(metadata_path));
+    if (path_result != JQ_OK) {
+        return send_response(client_fd, 400, "Bad Request", "invalid arguments\n");
+    }
+
+    const char *path = send_pdf ? pdf_path : metadata_path;
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT) {
+            return send_response(client_fd, 404, "Not Found", "job not found\n");
+        }
+        return send_response(client_fd, 500, "Internal Server Error", "io error\n");
+    }
+
+    const char *content_type = send_pdf ? "application/pdf" : "application/json";
+    if (!send_file(client_fd, content_type, path)) {
+        return send_response(client_fd, 500, "Internal Server Error", "io error\n");
+    }
+
+    return 1;
+}
+
 static int route_request(const char *root, const char *method, const char *path, int client_fd) {
     if (strcmp(method, "GET") != 0) {
         return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
@@ -339,6 +457,14 @@ static int route_request(const char *root, const char *method, const char *path,
 
     if (strcmp(path_buffer, "/move") == 0) {
         return handle_move(root, query, client_fd);
+    }
+
+    if (strcmp(path_buffer, "/status") == 0) {
+        return handle_status(root, query, client_fd);
+    }
+
+    if (strcmp(path_buffer, "/retrieve") == 0) {
+        return handle_retrieve(root, query, client_fd);
     }
 
     return send_response(client_fd, 404, "Not Found", "unknown endpoint\n");
