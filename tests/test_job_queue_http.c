@@ -359,6 +359,50 @@ static int test_http_missing_params(void) {
     return 1;
 }
 
+static int test_http_submit_missing_file(void) {
+    char template[] = "/tmp/pap_test_http_submit_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for submit missing")) {
+        return 0;
+    }
+
+    char metadata_src[PATH_MAX];
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for missing submit")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9105;
+    if (!assert_true(start_server(root, port, &pid), "start server for submit missing")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=missing-file&pdf=%s&metadata=%s'",
+             "%{http_code}", port, "/tmp/does-not-exist.pdf", metadata_src);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit missing file")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    if (!assert_true(strstr(status_buffer, "404") != NULL, "submit missing file status 404")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 static int test_http_claim_empty(void) {
     char template[] = "/tmp/pap_test_http_empty_XXXXXX";
     char *root = mkdtemp(template);
@@ -388,6 +432,305 @@ static int test_http_claim_empty(void) {
     }
 
     if (!assert_true(strstr(status_buffer, "404") != NULL, "claim empty status")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_move_endpoint(void) {
+    char template[] = "/tmp/pap_test_http_move_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for move")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for move")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for move")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9106;
+    if (!assert_true(start_server(root, port, &pid), "start server for move")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/submit?uuid=move-job&pdf=%s&metadata=%s'",
+             "%{http_code}", port, pdf_src, metadata_src);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "submit move job")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "submit move job 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/move?uuid=move-job&from=jobs&to=error'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "move request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "200") != NULL, "move status 200")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char pdf_error[PATH_MAX];
+    char metadata_error[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "move-job", JQ_STATE_ERROR, pdf_error, sizeof(pdf_error),
+                                  metadata_error, sizeof(metadata_error)) == JQ_OK,
+                     "error paths after move")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(pdf_error), "pdf moved to error")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(metadata_error), "metadata moved to error")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_status_missing_uuid(void) {
+    char template[] = "/tmp/pap_test_http_status_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for status missing")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9107;
+    if (!assert_true(start_server(root, port, &pid), "start server for status missing")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null http://127.0.0.1:%d/status",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "status missing uuid")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "400") != NULL, "status missing uuid 400")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_retrieve_invalid_kind(void) {
+    char template[] = "/tmp/pap_test_http_retrieve_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for retrieve invalid")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9108;
+    if (!assert_true(start_server(root, port, &pid), "start server for retrieve invalid")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/retrieve?uuid=missing&state=jobs&kind=bad'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "retrieve invalid kind")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "400") != NULL, "retrieve invalid kind 400")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_retrieve_not_found(void) {
+    char template[] = "/tmp/pap_test_http_retrieve_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for retrieve missing")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9109;
+    if (!assert_true(start_server(root, port, &pid), "start server for retrieve missing")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/retrieve?uuid=missing&state=jobs&kind=pdf'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "retrieve missing job")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "404") != NULL, "retrieve missing job 404")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_move_invalid_state(void) {
+    char template[] = "/tmp/pap_test_http_move_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for move invalid")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9110;
+    if (!assert_true(start_server(root, port, &pid), "start server for move invalid")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/move?uuid=missing&from=bad&to=jobs'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "move invalid state")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "400") != NULL, "move invalid state 400")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_finalize_missing_job(void) {
+    char template[] = "/tmp/pap_test_http_finalize_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for finalize missing")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9111;
+    if (!assert_true(start_server(root, port, &pid), "start server for finalize missing")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/finalize?uuid=missing&from=jobs&to=complete'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "finalize missing job")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "404") != NULL, "finalize missing job 404")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_release_missing_job(void) {
+    char template[] = "/tmp/pap_test_http_release_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for release missing")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9112;
+    if (!assert_true(start_server(root, port, &pid), "start server for release missing")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null "
+             "'http://127.0.0.1:%d/release?uuid=missing&state=jobs'",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "release missing job")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "404") != NULL, "release missing job 404")) {
         stop_server(pid);
         return 0;
     }
@@ -524,7 +867,15 @@ int main(void) {
     passed &= test_http_release_and_errors();
     passed &= test_http_invalid_method_and_not_found();
     passed &= test_http_missing_params();
+    passed &= test_http_submit_missing_file();
     passed &= test_http_claim_empty();
+    passed &= test_http_move_endpoint();
+    passed &= test_http_status_missing_uuid();
+    passed &= test_http_retrieve_invalid_kind();
+    passed &= test_http_retrieve_not_found();
+    passed &= test_http_move_invalid_state();
+    passed &= test_http_finalize_missing_job();
+    passed &= test_http_release_missing_job();
     passed &= test_http_status_and_retrieve();
 
     if (!passed) {
