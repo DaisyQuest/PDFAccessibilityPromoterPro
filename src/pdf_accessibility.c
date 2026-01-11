@@ -699,6 +699,153 @@ pdfa_result_t pdfa_report_to_html(const pdfa_report_t *report,
     return PDFA_OK;
 }
 
+pdfa_result_t pdfa_report_to_html_analysis(const pdfa_report_t *report,
+                                           const char *source_link,
+                                           char *buffer,
+                                           size_t buffer_len,
+                                           size_t *written_out) {
+    if (!report || !source_link || !buffer || buffer_len == 0) {
+        return PDFA_ERR_INVALID_ARGUMENT;
+    }
+
+    size_t offset = 0;
+    pdfa_result_t result = pdfa_append_html(
+        buffer,
+        buffer_len,
+        &offset,
+        "<!doctype html>"
+        "<html lang=\"en\">"
+        "<head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<title>Accessibility Analysis Report</title>"
+        "<style>"
+        ":root{color-scheme:light;--bg:#0b1020;--card:#141b33;--accent:#5ce1e6;--accent-2:#9b7bff;--text:#eef2ff;--muted:#a9b4d0;}"
+        "body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:radial-gradient(circle at top,#1b2550,#0b1020 60%);color:var(--text);}"
+        ".hero{padding:48px 32px;text-align:center;}"
+        ".hero h1{font-size:36px;margin:0 0 12px;letter-spacing:0.4px;}"
+        ".hero p{margin:0;color:var(--muted);}"
+        ".grid{display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));padding:0 32px 40px;}"
+        ".card{background:var(--card);border-radius:16px;padding:20px;box-shadow:0 12px 24px rgba(6,10,25,0.45);}"
+        ".badge{display:inline-block;padding:6px 12px;border-radius:999px;background:rgba(92,225,230,0.15);color:var(--accent);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:1px;}"
+        ".stats{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;color:var(--muted);}"
+        ".stat{background:rgba(255,255,255,0.04);border-radius:12px;padding:10px 12px;min-width:120px;}"
+        ".link{color:var(--accent);text-decoration:none;font-weight:600;}"
+        ".link:hover{text-decoration:underline;}"
+        ".issues{margin:0;padding-left:18px;color:var(--muted);}"
+        ".footer{padding:0 32px 40px;color:var(--muted);}"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<section class=\"hero\">"
+        "<span class=\"badge\">PDF Accessibility Promoter Pro</span>"
+        "<h1>Accessibility Analysis Report</h1>"
+        "<p>Snapshot of current accessibility signals without remediation.</p>"
+        "</section>");
+    if (result != PDFA_OK) {
+        return result;
+    }
+
+    result = pdfa_append_html(
+        buffer,
+        buffer_len,
+        &offset,
+        "<section class=\"grid\">"
+        "<div class=\"card\">"
+        "<h2>Source Document</h2>"
+        "<p><a class=\"link\" href=\"%s\">Source PDF</a></p>"
+        "<p>Analysis-only run; no corrections were applied.</p>"
+        "</div>"
+        "<div class=\"card\">"
+        "<h2>Analysis Summary</h2>"
+        "<div class=\"stats\">"
+        "<div class=\"stat\"><strong>PDF Version</strong><div>%d.%d</div></div>"
+        "<div class=\"stat\"><strong>Bytes Scanned</strong><div>%zu</div></div>"
+        "<div class=\"stat\"><strong>Total Size</strong><div>%zu</div></div>"
+        "</div>"
+        "</div>"
+        "<div class=\"card\">"
+        "<h2>Accessibility Signals</h2>"
+        "<div class=\"stats\">"
+        "<div class=\"stat\"><strong>Tagged</strong><div>%s</div></div>"
+        "<div class=\"stat\"><strong>Language</strong><div>%s</div></div>"
+        "<div class=\"stat\"><strong>Title</strong><div>%s</div></div>"
+        "<div class=\"stat\"><strong>Alt Text</strong><div>%s</div></div>"
+        "</div>"
+        "</div>"
+        "</section>",
+        source_link,
+        report->pdf_version_major,
+        report->pdf_version_minor,
+        report->bytes_scanned,
+        report->byte_count,
+        report->has_struct_tree_root ? "Present" : "Missing",
+        report->has_lang ? "Present" : "Missing",
+        report->has_title ? "Present" : "Missing",
+        (report->has_alt_text || report->has_actual_text) ? "Present" : "Missing");
+    if (result != PDFA_OK) {
+        return result;
+    }
+
+    result = pdfa_append_html(
+        buffer,
+        buffer_len,
+        &offset,
+        "<section class=\"grid\">"
+        "<div class=\"card\">"
+        "<h2>Outstanding Issues</h2>");
+    if (result != PDFA_OK) {
+        return result;
+    }
+
+    if (report->issue_count == 0) {
+        result = pdfa_append_html(buffer, buffer_len, &offset,
+                                  "<p>No outstanding accessibility issues detected.</p>");
+        if (result != PDFA_OK) {
+            return result;
+        }
+    } else {
+        result = pdfa_append_html(buffer, buffer_len, &offset, "<ul class=\"issues\">");
+        if (result != PDFA_OK) {
+            return result;
+        }
+        for (size_t i = 0; i < report->issue_count; ++i) {
+            const char *name = pdfa_issue_code_name(report->issues[i]);
+            result = pdfa_append_html(buffer, buffer_len, &offset, "<li>%s</li>", name);
+            if (result != PDFA_OK) {
+                return result;
+            }
+        }
+        result = pdfa_append_html(buffer, buffer_len, &offset, "</ul>");
+        if (result != PDFA_OK) {
+            return result;
+        }
+    }
+
+    result = pdfa_append_html(
+        buffer,
+        buffer_len,
+        &offset,
+        "</div>"
+        "<div class=\"card\">"
+        "<h2>Next Steps</h2>"
+        "<p>Review outstanding issues and schedule remediation steps if needed.</p>"
+        "<p>See <span class=\"badge\">problems_we_correct.md</span> for guidance.</p>"
+        "</div>"
+        "</section>"
+        "<div class=\"footer\">Generated by PDF Accessibility Promoter Pro.</div>"
+        "</body>"
+        "</html>");
+    if (result != PDFA_OK) {
+        return result;
+    }
+
+    if (written_out) {
+        *written_out = offset;
+    }
+    return PDFA_OK;
+}
+
 const char *pdfa_result_str(pdfa_result_t result) {
     switch (result) {
         case PDFA_OK:

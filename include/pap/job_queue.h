@@ -66,6 +66,26 @@ jq_result_t jq_job_paths(const char *root_path,
                          char *metadata_out,
                          size_t metadata_out_len);
 
+jq_result_t jq_job_paths_locked(const char *root_path,
+                                const char *uuid,
+                                jq_state_t state,
+                                char *pdf_out,
+                                size_t pdf_out_len,
+                                char *metadata_out,
+                                size_t metadata_out_len);
+
+jq_result_t jq_job_report_paths(const char *root_path,
+                                const char *uuid,
+                                jq_state_t state,
+                                char *report_out,
+                                size_t report_out_len);
+
+jq_result_t jq_job_report_paths_locked(const char *root_path,
+                                       const char *uuid,
+                                       jq_state_t state,
+                                       char *report_out,
+                                       size_t report_out_len);
+
 #ifdef __cplusplus
 }
 #endif

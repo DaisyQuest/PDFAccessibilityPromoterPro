@@ -715,6 +715,65 @@ static int test_html_success(void) {
            assert_true(written == strlen(buffer), "html written matches length");
 }
 
+static int test_html_analysis_invalid_args(void) {
+    char buffer[128];
+    pdfa_report_t report;
+    pdfa_report_init(&report);
+    return assert_true(pdfa_report_to_html_analysis(NULL, "source.pdf", buffer, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "analysis html should reject NULL report") &&
+           assert_true(pdfa_report_to_html_analysis(&report, NULL, buffer, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "analysis html should reject NULL source link") &&
+           assert_true(pdfa_report_to_html_analysis(&report, "source.pdf", NULL, sizeof(buffer), NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "analysis html should reject NULL buffer") &&
+           assert_true(pdfa_report_to_html_analysis(&report, "source.pdf", buffer, 0, NULL) ==
+                           PDFA_ERR_INVALID_ARGUMENT,
+                       "analysis html should reject zero buffer");
+}
+
+static int test_html_analysis_buffer_too_small(void) {
+    pdfa_report_t report;
+    pdfa_report_init(&report);
+    report.pdf_version_major = 1;
+    report.pdf_version_minor = 7;
+    char buffer[16];
+    return assert_true(pdfa_report_to_html_analysis(&report,
+                                                    "source.pdf",
+                                                    buffer,
+                                                    sizeof(buffer),
+                                                    NULL) == PDFA_ERR_BUFFER_TOO_SMALL,
+                       "analysis html should report buffer too small");
+}
+
+static int test_html_analysis_success(void) {
+    const char *fixed_path = "tests/fixtures/fixed_document.pdf";
+    pdfa_report_t report;
+    if (!assert_true(pdfa_analyze_file(fixed_path, &report) == PDFA_OK, "analyze for analysis html success")) {
+        return 0;
+    }
+
+    char buffer[4096];
+    size_t written = 0;
+    if (!assert_true(pdfa_report_to_html_analysis(&report,
+                                                  "tests/fixtures/fixed_document.pdf",
+                                                  buffer,
+                                                  sizeof(buffer),
+                                                  &written) == PDFA_OK,
+                     "analysis html should succeed")) {
+        return 0;
+    }
+
+    return assert_true(strstr(buffer, "<!doctype html>") != NULL, "analysis html includes doctype") &&
+           assert_true(strstr(buffer, "Accessibility Analysis Report") != NULL,
+                       "analysis html includes report title") &&
+           assert_true(strstr(buffer, "Source PDF") != NULL, "analysis html includes source link text") &&
+           assert_true(strstr(buffer, "tests/fixtures/fixed_document.pdf") != NULL,
+                       "analysis html includes source link href") &&
+           assert_true(written == strlen(buffer), "analysis html written matches length");
+}
+
 static int test_result_str(void) {
     return assert_true(strcmp(pdfa_result_str(PDFA_OK), "ok") == 0, "result ok") &&
            assert_true(strcmp(pdfa_result_str(PDFA_ERR_INVALID_ARGUMENT), "invalid_argument") == 0,
@@ -748,6 +807,9 @@ int main(void) {
     ok &= test_html_invalid_args();
     ok &= test_html_buffer_too_small();
     ok &= test_html_success();
+    ok &= test_html_analysis_invalid_args();
+    ok &= test_html_analysis_buffer_too_small();
+    ok &= test_html_analysis_success();
     ok &= test_result_str();
 
     if (ok) {

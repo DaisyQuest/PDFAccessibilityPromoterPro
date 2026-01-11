@@ -205,6 +205,53 @@ static int test_http_submit_claim_finalize(void) {
     return 1;
 }
 
+static int test_http_retrieve_report(void) {
+    char template[] = "/tmp/pap_test_http_report_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for report")) {
+        return 0;
+    }
+
+    char report_path[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "report-job", JQ_STATE_COMPLETE,
+                                         report_path, sizeof(report_path)) == JQ_OK,
+                     "report path")) {
+        return 0;
+    }
+    if (!assert_true(write_file(report_path, "<html>report</html>"), "write report file")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9106;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for report")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char output[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command),
+             "curl -s 'http://127.0.0.1:%d/retrieve?uuid=report-job&state=complete&kind=report'",
+             port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "retrieve report request")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    if (!assert_true(strstr(output, "report</html>") != NULL, "report response contains html")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 static int test_http_release_and_errors(void) {
     char template[] = "/tmp/pap_test_http_release_XXXXXX";
     char *root = mkdtemp(template);
@@ -1057,6 +1104,7 @@ static int test_http_invalid_uuid_and_path(void) {
 int main(void) {
     int passed = 1;
     passed &= test_http_submit_claim_finalize();
+    passed &= test_http_retrieve_report();
     passed &= test_http_release_and_errors();
     passed &= test_http_invalid_method_and_not_found();
     passed &= test_http_missing_params();

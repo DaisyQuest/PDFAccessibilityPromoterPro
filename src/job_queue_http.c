@@ -900,19 +900,29 @@ static int handle_retrieve(const char *root, const char *query, int client_fd) {
 
     int send_pdf = strcmp(kind_value, "pdf") == 0;
     int send_metadata = strcmp(kind_value, "metadata") == 0;
-    if (!send_pdf && !send_metadata) {
+    int send_report = strcmp(kind_value, "report") == 0;
+    if (!send_pdf && !send_metadata && !send_report) {
         return send_response(client_fd, 400, "Bad Request", "invalid kind\n");
     }
 
     char pdf_path[HTTP_PATH_SIZE];
     char metadata_path[HTTP_PATH_SIZE];
+    char report_path[HTTP_PATH_SIZE];
     jq_result_t path_result =
         jq_job_paths(root, uuid, state, pdf_path, sizeof(pdf_path), metadata_path, sizeof(metadata_path));
     if (path_result != JQ_OK) {
         return send_response(client_fd, 400, "Bad Request", "invalid arguments\n");
     }
 
-    const char *path = send_pdf ? pdf_path : metadata_path;
+    if (send_report) {
+        jq_result_t report_result =
+            jq_job_report_paths(root, uuid, state, report_path, sizeof(report_path));
+        if (report_result != JQ_OK) {
+            return send_response(client_fd, 400, "Bad Request", "invalid arguments\n");
+        }
+    }
+
+    const char *path = send_pdf ? pdf_path : (send_metadata ? metadata_path : report_path);
     char resolved[PATH_MAX];
     int status = 0;
     if (!resolve_existing_under_root(root, path, resolved, sizeof(resolved), &status)) {
@@ -925,7 +935,8 @@ static int handle_retrieve(const char *root, const char *query, int client_fd) {
         return send_response(client_fd, 500, "Internal Server Error", "io error\n");
     }
 
-    const char *content_type = send_pdf ? "application/pdf" : "application/json";
+    const char *content_type = send_pdf ? "application/pdf" :
+                               (send_metadata ? "application/json" : "text/html");
     send_result_t send_result = send_file(client_fd, content_type, resolved);
     if (send_result == SEND_NOT_FOUND) {
         return send_response(client_fd, 404, "Not Found", "job not found\n");
