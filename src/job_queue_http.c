@@ -1366,6 +1366,239 @@ static int test_extract_bearer(void) {
     return 1;
 }
 
+static int test_get_header_value(void) {
+    const char *request =
+        "GET /health HTTP/1.1\r\n"
+        "Host: example\r\n"
+        "Authorization: Bearer token123  \r\n"
+        "X-Empty: \r\n"
+        "\r\n";
+    char value[64];
+    if (!assert_true(get_header_value(request, "Authorization", value, sizeof(value)), "header value found")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(value, "Bearer token123") == 0, "header value trimmed")) {
+        return 0;
+    }
+    if (!assert_true(!get_header_value(request, "Missing", value, sizeof(value)), "missing header")) {
+        return 0;
+    }
+    char small[4];
+    if (!assert_true(!get_header_value(request, "Authorization", small, sizeof(small)), "header value overflow")) {
+        return 0;
+    }
+    if (!assert_true(get_header_value(request, "X-Empty", value, sizeof(value)), "empty header value")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(value, "") == 0, "empty header value string")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_parse_state_and_uuid(void) {
+    jq_state_t state = JQ_STATE_JOBS;
+    if (!assert_true(parse_state("jobs", &state) && state == JQ_STATE_JOBS, "parse jobs")) {
+        return 0;
+    }
+    if (!assert_true(parse_state("priority", &state) && state == JQ_STATE_PRIORITY, "parse priority")) {
+        return 0;
+    }
+    if (!assert_true(parse_state("complete", &state) && state == JQ_STATE_COMPLETE, "parse complete")) {
+        return 0;
+    }
+    if (!assert_true(parse_state("error", &state) && state == JQ_STATE_ERROR, "parse error")) {
+        return 0;
+    }
+    if (!assert_true(!parse_state("unknown", &state), "reject unknown state")) {
+        return 0;
+    }
+
+    if (!assert_true(is_valid_uuid("job-1_ok") == 200, "valid uuid")) {
+        return 0;
+    }
+    if (!assert_true(!is_valid_uuid("bad uuid"), "reject space")) {
+        return 0;
+    }
+    if (!assert_true(!is_valid_uuid("bad/uuid"), "reject slash")) {
+        return 0;
+    }
+    char long_uuid[HTTP_UUID_SIZE + 1];
+    memset(long_uuid, 'a', sizeof(long_uuid));
+    long_uuid[sizeof(long_uuid) - 1] = '\0';
+    if (!assert_true(!is_valid_uuid(long_uuid), "reject too long uuid")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_query_param_and_root_paths(void) {
+    char output[HTTP_PATH_SIZE];
+    if (!assert_true(get_query_param("uuid=test&pdf=file+name.pdf", "pdf", output, sizeof(output)),
+                     "get query param")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(output, "file name.pdf") == 0, "query param decoded plus")) {
+        return 0;
+    }
+    if (!assert_true(get_query_param("a=1&b=two%20words", "b", output, sizeof(output)),
+                     "get query param encoded")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(output, "two words") == 0, "query param decoded percent")) {
+        return 0;
+    }
+    if (!assert_true(!get_query_param("a=1&b=2", "missing", output, sizeof(output)),
+                     "missing query param")) {
+        return 0;
+    }
+
+    char template[] = "/tmp/pap_http_root_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char root_real[PATH_MAX];
+    if (!realpath(root, root_real)) {
+        perror("realpath");
+        return 0;
+    }
+
+    char rooted[PATH_MAX];
+    if (!assert_true(build_rooted_path(root_real, "file.pdf", rooted, sizeof(rooted)), "build rooted path")) {
+        return 0;
+    }
+    if (!assert_true(strstr(rooted, "file.pdf") != NULL, "rooted path includes file")) {
+        return 0;
+    }
+    size_t tiny_len = strlen(root_real) + 2;
+    char *tiny = malloc(tiny_len);
+    if (!tiny) {
+        fprintf(stderr, "malloc failed\n");
+        return 0;
+    }
+    int overflow_ok = !build_rooted_path(root_real, "file.pdf", tiny, tiny_len);
+    free(tiny);
+    if (!assert_true(overflow_ok, "rooted path overflow")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_resolve_existing_under_root(void) {
+    char root_template[] = "/tmp/pap_http_root_real_XXXXXX";
+    char *root = mkdtemp(root_template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char root_real[PATH_MAX];
+    if (!realpath(root, root_real)) {
+        perror("realpath root");
+        return 0;
+    }
+
+    char file_path[PATH_MAX];
+    size_t root_len = strlen(root_real);
+    const char *file_suffix = "/file.txt";
+    if (root_len + strlen(file_suffix) + 1 > sizeof(file_path)) {
+        fprintf(stderr, "root path too long\n");
+        return 0;
+    }
+    memcpy(file_path, root_real, root_len);
+    memcpy(file_path + root_len, file_suffix, strlen(file_suffix) + 1);
+    FILE *fp = fopen(file_path, "w");
+    if (!fp) {
+        perror("fopen");
+        return 0;
+    }
+    fputs("data", fp);
+    fclose(fp);
+
+    char resolved[PATH_MAX];
+    int status = 0;
+    if (!assert_true(resolve_existing_under_root(root_real, file_path, resolved, sizeof(resolved), &status),
+                     "resolve existing under root")) {
+        return 0;
+    }
+    if (!assert_true(status == 200, "resolve existing status")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(resolved, file_path) == 0, "resolved path matches")) {
+        return 0;
+    }
+
+    char missing_path[PATH_MAX];
+    const char *missing_suffix = "/missing.txt";
+    if (root_len + strlen(missing_suffix) + 1 > sizeof(missing_path)) {
+        fprintf(stderr, "root path too long for missing\n");
+        return 0;
+    }
+    memcpy(missing_path, root_real, root_len);
+    memcpy(missing_path + root_len, missing_suffix, strlen(missing_suffix) + 1);
+    status = 0;
+    if (!assert_true(!resolve_existing_under_root(root_real, missing_path, resolved, sizeof(resolved), &status),
+                     "resolve missing under root")) {
+        return 0;
+    }
+    if (!assert_true(status == 404, "missing file status")) {
+        return 0;
+    }
+
+    char outside_template[] = "/tmp/pap_http_outside_XXXXXX";
+    char *outside = mkdtemp(outside_template);
+    if (!outside) {
+        perror("mkdtemp outside failed");
+        return 0;
+    }
+    char outside_real[PATH_MAX];
+    if (!realpath(outside, outside_real)) {
+        perror("realpath outside");
+        return 0;
+    }
+    char outside_file[PATH_MAX];
+    size_t outside_len = strlen(outside_real);
+    const char *outside_suffix = "/outside.txt";
+    if (outside_len + strlen(outside_suffix) + 1 > sizeof(outside_file)) {
+        fprintf(stderr, "outside path too long\n");
+        return 0;
+    }
+    memcpy(outside_file, outside_real, outside_len);
+    memcpy(outside_file + outside_len, outside_suffix, strlen(outside_suffix) + 1);
+    fp = fopen(outside_file, "w");
+    if (!fp) {
+        perror("fopen outside");
+        return 0;
+    }
+    fputs("data", fp);
+    fclose(fp);
+
+    status = 0;
+    if (!assert_true(!resolve_existing_under_root(root_real, outside_file, resolved, sizeof(resolved), &status),
+                     "resolve outside root")) {
+        return 0;
+    }
+    if (!assert_true(status == 403, "outside root status")) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int test_build_log_path(void) {
+    char out[HTTP_PATH_SIZE];
+    build_log_path("/submit?uuid=job", out, sizeof(out));
+    if (!assert_true(strcmp(out, "/submit") == 0, "log path strips query")) {
+        return 0;
+    }
+    build_log_path("/bad%0Apath", out, sizeof(out));
+    if (!assert_true(strcmp(out, "/bad?path") == 0, "log path sanitizes control char")) {
+        return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_url_decode();
@@ -1373,6 +1606,11 @@ int main(void) {
     passed &= test_is_safe_relpath();
     passed &= test_token_compare();
     passed &= test_extract_bearer();
+    passed &= test_get_header_value();
+    passed &= test_parse_state_and_uuid();
+    passed &= test_query_param_and_root_paths();
+    passed &= test_resolve_existing_under_root();
+    passed &= test_build_log_path();
 
     if (!passed) {
         fprintf(stderr, "HTTP helper tests failed.\n");
