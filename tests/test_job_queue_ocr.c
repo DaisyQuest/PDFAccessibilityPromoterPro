@@ -111,6 +111,7 @@ static int test_ocr_success(void) {
     }
 
     return assert_true(strstr(metadata_buffer, "\"ocr_status\":\"complete\"") != NULL, "metadata status") &&
+           assert_true(strstr(metadata_buffer, "\"ocr_provider\":\"builtin\"") != NULL, "metadata provider") &&
            assert_true(strstr(metadata_buffer, "\"pdf_version\":\"1.6\"") != NULL, "metadata version");
 }
 
@@ -188,12 +189,66 @@ static int test_ocr_empty_queue(void) {
     return assert_true(run_command(command) == 2, "ocr command no jobs");
 }
 
+static int test_ocr_provider_missing(void) {
+    char template[] = "/tmp/pap_test_ocr_provider_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init ocr provider root")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    const char *contents = "%PDF-1.6\n1 0 obj\n<<>>\nendobj\n";
+    if (!assert_true(write_file(pdf_src, contents), "write provider pdf")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "{}"), "write metadata")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_submit(root, "missing-provider", pdf_src, metadata_src, 0) == JQ_OK,
+                     "submit missing provider job")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    snprintf(command, sizeof(command), "PAP_OCR_PROVIDER=missing ./job_queue_ocr %s", root);
+    if (!assert_true(run_command(command) == 1, "ocr command missing provider failure")) {
+        return 0;
+    }
+
+    char pdf_error[PATH_MAX];
+    char metadata_error[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "missing-provider", JQ_STATE_ERROR,
+                                  pdf_error, sizeof(pdf_error),
+                                  metadata_error, sizeof(metadata_error)) == JQ_OK,
+                     "missing provider error paths")) {
+        return 0;
+    }
+
+    char metadata_buffer[256];
+    if (!assert_true(read_file(metadata_error, metadata_buffer, sizeof(metadata_buffer)),
+                     "read provider error metadata")) {
+        return 0;
+    }
+    return assert_true(strstr(metadata_buffer, "\"error\"") != NULL, "provider error metadata includes error") &&
+           assert_true(strstr(metadata_buffer, "provider_not_found") != NULL, "metadata includes provider_not_found");
+}
+
 int main(void) {
     int passed = 1;
 
     passed &= test_ocr_success();
     passed &= test_ocr_parse_error();
     passed &= test_ocr_empty_queue();
+    passed &= test_ocr_provider_missing();
 
     if (!passed) {
         fprintf(stderr, "OCR job tests failed.\n");
