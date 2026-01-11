@@ -21,9 +21,9 @@
 - [ ] Benchmarks documented.
 
 ## PDF Accessibility Processing
-- [ ] Tagging/structure parsing implemented.
-- [ ] Accessibility issue detection implemented.
-- [ ] Accessibility report generation implemented.
+- [x] Tagging/structure parsing implemented.
+- [x] Accessibility issue detection implemented.
+- [x] Accessibility report generation implemented.
 
 ## API
 - [x] Job submission API implemented.
