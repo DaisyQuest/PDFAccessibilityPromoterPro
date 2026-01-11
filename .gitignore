@@ -1,0 +1,6 @@
+*.o
+/tests/test_job_queue
+/tests/test_job_queue_cli
+/job_queue_cli
+/tests/test_job_queue_http
+/job_queue_http
