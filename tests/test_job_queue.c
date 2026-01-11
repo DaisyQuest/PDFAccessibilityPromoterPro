@@ -33,6 +33,10 @@ static int write_file(const char *path, const char *contents) {
     return 1;
 }
 
+static int write_report_file(const char *path) {
+    return write_file(path, "<html>report</html>");
+}
+
 static int read_file(const char *path, char *buffer, size_t buffer_len) {
     FILE *fp = fopen(path, "r");
     if (!fp) {
@@ -202,6 +206,19 @@ static int test_job_paths_invalid(void) {
     return assert_true(jq_job_paths(NULL, "id", JQ_STATE_JOBS, buffer, sizeof(buffer), buffer, sizeof(buffer)) ==
                            JQ_ERR_INVALID_ARGUMENT,
                        "jq_job_paths should reject NULL root");
+}
+
+static int test_report_paths_invalid(void) {
+    char buffer[64];
+    return assert_true(jq_job_report_paths(NULL, "id", JQ_STATE_JOBS, buffer, sizeof(buffer)) ==
+                           JQ_ERR_INVALID_ARGUMENT,
+                       "jq_job_report_paths should reject NULL root") &&
+           assert_true(jq_job_report_paths("root", NULL, JQ_STATE_JOBS, buffer, sizeof(buffer)) ==
+                           JQ_ERR_INVALID_ARGUMENT,
+                       "jq_job_report_paths should reject NULL uuid") &&
+           assert_true(jq_job_report_paths("root", "id", JQ_STATE_JOBS, NULL, sizeof(buffer)) ==
+                           JQ_ERR_INVALID_ARGUMENT,
+                       "jq_job_report_paths should reject NULL buffer");
 }
 
 static int test_job_paths_overflow(void) {
@@ -991,6 +1008,136 @@ static int test_finalize_invalid_state(void) {
                        "jq_finalize rejects invalid from state");
 }
 
+static int test_report_moves_on_finalize(void) {
+    char template[] = "/tmp/pap_test_report_finalize_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for report finalize")) {
+        return 0;
+    }
+
+    if (!assert_true(create_job_files(root, "report-finalize", 0), "create job files for report finalize")) {
+        return 0;
+    }
+
+    char uuid[64];
+    jq_state_t state = JQ_STATE_JOBS;
+    if (!assert_true(jq_claim_next(root, 0, uuid, sizeof(uuid), &state) == JQ_OK, "claim for report finalize")) {
+        return 0;
+    }
+
+    char report_locked[PATH_MAX];
+    if (!assert_true(jq_job_report_paths_locked(root, "report-finalize", state,
+                                                report_locked, sizeof(report_locked)) == JQ_OK,
+                     "report locked path finalize")) {
+        return 0;
+    }
+    if (!assert_true(write_report_file(report_locked), "write report locked finalize")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_finalize(root, "report-finalize", state, JQ_STATE_COMPLETE) == JQ_OK,
+                     "finalize report job")) {
+        return 0;
+    }
+
+    char report_complete[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "report-finalize", JQ_STATE_COMPLETE,
+                                         report_complete, sizeof(report_complete)) == JQ_OK,
+                     "report complete path finalize")) {
+        return 0;
+    }
+    return assert_true(file_exists(report_complete), "report moved on finalize");
+}
+
+static int test_report_moves_on_release(void) {
+    char template[] = "/tmp/pap_test_report_release_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for report release")) {
+        return 0;
+    }
+
+    if (!assert_true(create_job_files(root, "report-release", 0), "create job files for report release")) {
+        return 0;
+    }
+
+    char uuid[64];
+    jq_state_t state = JQ_STATE_JOBS;
+    if (!assert_true(jq_claim_next(root, 0, uuid, sizeof(uuid), &state) == JQ_OK, "claim for report release")) {
+        return 0;
+    }
+
+    char report_locked[PATH_MAX];
+    if (!assert_true(jq_job_report_paths_locked(root, "report-release", state,
+                                                report_locked, sizeof(report_locked)) == JQ_OK,
+                     "report locked path release")) {
+        return 0;
+    }
+    if (!assert_true(write_report_file(report_locked), "write report locked release")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_release(root, "report-release", state) == JQ_OK, "release report job")) {
+        return 0;
+    }
+
+    char report_unlocked[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "report-release", state,
+                                         report_unlocked, sizeof(report_unlocked)) == JQ_OK,
+                     "report unlocked path release")) {
+        return 0;
+    }
+    return assert_true(file_exists(report_unlocked), "report moved on release");
+}
+
+static int test_report_moves_on_move(void) {
+    char template[] = "/tmp/pap_test_report_move_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for report move")) {
+        return 0;
+    }
+
+    if (!assert_true(create_job_files(root, "report-move", 0), "create job files for report move")) {
+        return 0;
+    }
+
+    char report_jobs[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "report-move", JQ_STATE_JOBS,
+                                         report_jobs, sizeof(report_jobs)) == JQ_OK,
+                     "report jobs path move")) {
+        return 0;
+    }
+    if (!assert_true(write_report_file(report_jobs), "write report jobs")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_move(root, "report-move", JQ_STATE_JOBS, JQ_STATE_COMPLETE) == JQ_OK, "move report job")) {
+        return 0;
+    }
+
+    char report_complete[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "report-move", JQ_STATE_COMPLETE,
+                                         report_complete, sizeof(report_complete)) == JQ_OK,
+                     "report complete path move")) {
+        return 0;
+    }
+    return assert_true(file_exists(report_complete), "report moved on move");
+}
+
 static int test_status_invalid_args(void) {
     jq_state_t state = JQ_STATE_JOBS;
     int locked = 0;
@@ -1133,6 +1280,7 @@ int main(void) {
     passed &= test_init_invalid();
     passed &= test_init_empty();
     passed &= test_job_paths_invalid();
+    passed &= test_report_paths_invalid();
     passed &= test_job_paths_overflow();
     passed &= test_submit_and_move();
     passed &= test_submit_missing_source();
@@ -1158,6 +1306,9 @@ int main(void) {
     passed &= test_finalize_invalid_args();
     passed &= test_finalize_missing_job();
     passed &= test_finalize_invalid_state();
+    passed &= test_report_moves_on_finalize();
+    passed &= test_report_moves_on_release();
+    passed &= test_report_moves_on_move();
     passed &= test_status_invalid_args();
     passed &= test_status_unlocked_and_locked();
     passed &= test_status_not_found();

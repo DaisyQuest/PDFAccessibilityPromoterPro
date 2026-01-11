@@ -199,13 +199,13 @@ static jq_result_t jq_copy_file(const char *src_path, const char *dst_path) {
     return JQ_OK;
 }
 
-static jq_result_t jq_job_paths_locked(const char *root_path,
-                                       const char *uuid,
-                                       jq_state_t state,
-                                       char *pdf_out,
-                                       size_t pdf_out_len,
-                                       char *metadata_out,
-                                       size_t metadata_out_len) {
+jq_result_t jq_job_paths_locked(const char *root_path,
+                                const char *uuid,
+                                jq_state_t state,
+                                char *pdf_out,
+                                size_t pdf_out_len,
+                                char *metadata_out,
+                                size_t metadata_out_len) {
     if (!root_path || !uuid || !pdf_out || !metadata_out) {
         return JQ_ERR_INVALID_ARGUMENT;
     }
@@ -221,6 +221,50 @@ static jq_result_t jq_job_paths_locked(const char *root_path,
 
     if (pdf_written < 0 || metadata_written < 0 ||
         (size_t)pdf_written >= pdf_out_len || (size_t)metadata_written >= metadata_out_len) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    return JQ_OK;
+}
+
+jq_result_t jq_job_report_paths(const char *root_path,
+                                const char *uuid,
+                                jq_state_t state,
+                                char *report_out,
+                                size_t report_out_len) {
+    if (!root_path || !uuid || !report_out) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    const char *dir = jq_state_dir(state);
+    if (!dir) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    int written = snprintf(report_out, report_out_len, "%s/%s/%s.report.html", root_path, dir, uuid);
+    if (written < 0 || (size_t)written >= report_out_len) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    return JQ_OK;
+}
+
+jq_result_t jq_job_report_paths_locked(const char *root_path,
+                                       const char *uuid,
+                                       jq_state_t state,
+                                       char *report_out,
+                                       size_t report_out_len) {
+    if (!root_path || !uuid || !report_out) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    const char *dir = jq_state_dir(state);
+    if (!dir) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    int written = snprintf(report_out, report_out_len, "%s/%s/%s.report.html.lock", root_path, dir, uuid);
+    if (written < 0 || (size_t)written >= report_out_len) {
         return JQ_ERR_INVALID_ARGUMENT;
     }
 
@@ -300,6 +344,19 @@ static jq_result_t jq_rename(const char *src, const char *dst) {
     return JQ_ERR_IO;
 }
 
+static jq_result_t jq_move_report_if_present(const char *report_src, const char *report_dst) {
+    if (!report_src || !report_dst) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+    if (access(report_src, F_OK) != 0) {
+        if (errno == ENOENT) {
+            return JQ_OK;
+        }
+        return JQ_ERR_IO;
+    }
+    return jq_rename(report_src, report_dst);
+}
+
 static jq_result_t jq_check_pair_exists(const char *pdf_path, const char *metadata_path, int *present_out) {
     if (!pdf_path || !metadata_path || !present_out) {
         return JQ_ERR_INVALID_ARGUMENT;
@@ -338,6 +395,8 @@ jq_result_t jq_move(const char *root_path,
     char metadata_src[PATH_MAX];
     char pdf_dst[PATH_MAX];
     char metadata_dst[PATH_MAX];
+    char report_src[PATH_MAX];
+    char report_dst[PATH_MAX];
 
     jq_result_t src_result =
         jq_job_paths(root_path, uuid, from_state, pdf_src, sizeof(pdf_src), metadata_src, sizeof(metadata_src));
@@ -351,6 +410,18 @@ jq_result_t jq_move(const char *root_path,
         return dst_result;
     }
 
+    jq_result_t report_src_result =
+        jq_job_report_paths(root_path, uuid, from_state, report_src, sizeof(report_src));
+    if (report_src_result != JQ_OK) {
+        return report_src_result;
+    }
+
+    jq_result_t report_dst_result =
+        jq_job_report_paths(root_path, uuid, to_state, report_dst, sizeof(report_dst));
+    if (report_dst_result != JQ_OK) {
+        return report_dst_result;
+    }
+
     jq_result_t pdf_move = jq_rename(pdf_src, pdf_dst);
     if (pdf_move != JQ_OK) {
         return pdf_move;
@@ -360,6 +431,13 @@ jq_result_t jq_move(const char *root_path,
     if (metadata_move != JQ_OK) {
         jq_rename(pdf_dst, pdf_src);
         return metadata_move;
+    }
+
+    jq_result_t report_move = jq_move_report_if_present(report_src, report_dst);
+    if (report_move != JQ_OK) {
+        jq_rename(metadata_dst, metadata_src);
+        jq_rename(pdf_dst, pdf_src);
+        return report_move;
     }
 
     return JQ_OK;
@@ -563,6 +641,8 @@ jq_result_t jq_release(const char *root_path,
     char metadata_locked[PATH_MAX];
     char pdf_dest[PATH_MAX];
     char metadata_dest[PATH_MAX];
+    char report_locked[PATH_MAX];
+    char report_dest[PATH_MAX];
 
     jq_result_t locked_result = jq_job_paths_locked(root_path, uuid, state,
                                                     pdf_locked, sizeof(pdf_locked),
@@ -578,6 +658,18 @@ jq_result_t jq_release(const char *root_path,
         return dest_result;
     }
 
+    jq_result_t report_locked_result =
+        jq_job_report_paths_locked(root_path, uuid, state, report_locked, sizeof(report_locked));
+    if (report_locked_result != JQ_OK) {
+        return report_locked_result;
+    }
+
+    jq_result_t report_dest_result =
+        jq_job_report_paths(root_path, uuid, state, report_dest, sizeof(report_dest));
+    if (report_dest_result != JQ_OK) {
+        return report_dest_result;
+    }
+
     jq_result_t pdf_release = jq_rename(pdf_locked, pdf_dest);
     if (pdf_release != JQ_OK) {
         return pdf_release;
@@ -587,6 +679,13 @@ jq_result_t jq_release(const char *root_path,
     if (metadata_release != JQ_OK) {
         jq_rename(pdf_dest, pdf_locked);
         return metadata_release;
+    }
+
+    jq_result_t report_release = jq_move_report_if_present(report_locked, report_dest);
+    if (report_release != JQ_OK) {
+        jq_rename(metadata_dest, metadata_locked);
+        jq_rename(pdf_dest, pdf_locked);
+        return report_release;
     }
 
     return JQ_OK;
@@ -604,6 +703,8 @@ jq_result_t jq_finalize(const char *root_path,
     char metadata_locked[PATH_MAX];
     char pdf_dest[PATH_MAX];
     char metadata_dest[PATH_MAX];
+    char report_locked[PATH_MAX];
+    char report_dest[PATH_MAX];
 
     jq_result_t locked_result = jq_job_paths_locked(root_path, uuid, from_state,
                                                     pdf_locked, sizeof(pdf_locked),
@@ -619,6 +720,18 @@ jq_result_t jq_finalize(const char *root_path,
         return dest_result;
     }
 
+    jq_result_t report_locked_result =
+        jq_job_report_paths_locked(root_path, uuid, from_state, report_locked, sizeof(report_locked));
+    if (report_locked_result != JQ_OK) {
+        return report_locked_result;
+    }
+
+    jq_result_t report_dest_result =
+        jq_job_report_paths(root_path, uuid, to_state, report_dest, sizeof(report_dest));
+    if (report_dest_result != JQ_OK) {
+        return report_dest_result;
+    }
+
     jq_result_t pdf_move = jq_rename(pdf_locked, pdf_dest);
     if (pdf_move != JQ_OK) {
         return pdf_move;
@@ -628,6 +741,13 @@ jq_result_t jq_finalize(const char *root_path,
     if (metadata_move != JQ_OK) {
         jq_rename(pdf_dest, pdf_locked);
         return metadata_move;
+    }
+
+    jq_result_t report_move = jq_move_report_if_present(report_locked, report_dest);
+    if (report_move != JQ_OK) {
+        jq_rename(metadata_dest, metadata_locked);
+        jq_rename(pdf_dest, pdf_locked);
+        return report_move;
     }
 
     return JQ_OK;

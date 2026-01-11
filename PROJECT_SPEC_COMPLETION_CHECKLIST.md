@@ -28,6 +28,7 @@
 - [x] Accessibility issue detection implemented.
 - [x] Accessibility report generation implemented.
 - [x] Language/title/text alternative value validation refined.
+- [x] Analysis-only job reporting implemented.
 
 ## API
 - [x] Job submission API implemented.
