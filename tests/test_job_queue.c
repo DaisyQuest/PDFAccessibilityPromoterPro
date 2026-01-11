@@ -78,6 +78,10 @@ static int test_init_invalid(void) {
     return assert_true(jq_init(NULL) == JQ_ERR_INVALID_ARGUMENT, "jq_init should reject NULL");
 }
 
+static int test_init_empty(void) {
+    return assert_true(jq_init("") == JQ_ERR_INVALID_ARGUMENT, "jq_init should reject empty root");
+}
+
 static int test_job_paths_invalid(void) {
     char buffer[64];
     return assert_true(jq_job_paths(NULL, "id", JQ_STATE_JOBS, buffer, sizeof(buffer), buffer, sizeof(buffer)) ==
@@ -196,6 +200,50 @@ static int test_submit_missing_source(void) {
     return 1;
 }
 
+static int test_submit_metadata_cleanup(void) {
+    char template[] = "/tmp/pap_test_submit_cleanup_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for submit cleanup")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf source")) {
+        return 0;
+    }
+
+    char metadata_src[PATH_MAX];
+    snprintf(metadata_src, sizeof(metadata_src), "%s/missing.metadata", root);
+
+    jq_result_t submit_result = jq_submit(root, "job-cleanup", pdf_src, metadata_src, 0);
+    if (!assert_true(submit_result == JQ_ERR_NOT_FOUND, "missing metadata returns not found")) {
+        return 0;
+    }
+
+    char pdf_dest[PATH_MAX];
+    char metadata_dest[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-cleanup", JQ_STATE_JOBS, pdf_dest, sizeof(pdf_dest),
+                                  metadata_dest, sizeof(metadata_dest)) == JQ_OK,
+                     "paths for cleanup job")) {
+        return 0;
+    }
+
+    if (!assert_true(!file_exists(pdf_dest), "pdf cleaned up after metadata failure")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(metadata_dest), "metadata not created on failure")) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static int test_move_missing_job(void) {
     char template[] = "/tmp/pap_test_move_missing_XXXXXX";
     char *root = mkdtemp(template);
@@ -216,9 +264,57 @@ static int test_move_missing_job(void) {
     return 1;
 }
 
+static int test_move_partial_pair(void) {
+    char template[] = "/tmp/pap_test_move_partial_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for move partial")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/jobs/partial.pdf.job", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write partial pdf")) {
+        return 0;
+    }
+
+    jq_result_t move_result = jq_move(root, "partial", JQ_STATE_JOBS, JQ_STATE_COMPLETE);
+    if (!assert_true(move_result == JQ_ERR_NOT_FOUND, "move partial pair returns not found")) {
+        return 0;
+    }
+
+    char pdf_complete[PATH_MAX];
+    char metadata_complete[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "partial", JQ_STATE_COMPLETE, pdf_complete, sizeof(pdf_complete),
+                                  metadata_complete, sizeof(metadata_complete)) == JQ_OK,
+                     "complete paths for partial")) {
+        return 0;
+    }
+
+    if (!assert_true(file_exists(pdf_src), "pdf restored after failed move")) {
+        return 0;
+    }
+    if (!assert_true(!file_exists(pdf_complete), "pdf not moved to complete")) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static int test_submit_invalid_args(void) {
     return assert_true(jq_submit(NULL, "id", "pdf", "meta", 0) == JQ_ERR_INVALID_ARGUMENT,
                        "jq_submit should reject NULL root");
+}
+
+static int test_job_paths_invalid_state(void) {
+    char buffer[64];
+    return assert_true(jq_job_paths("/tmp", "id", (jq_state_t)77, buffer, sizeof(buffer), buffer, sizeof(buffer)) ==
+                           JQ_ERR_INVALID_ARGUMENT,
+                       "jq_job_paths should reject invalid state");
 }
 
 static int test_move_invalid_state(void) {
@@ -239,6 +335,28 @@ static int test_move_invalid_state(void) {
     }
 
     return 1;
+}
+
+static int test_claim_uuid_too_small(void) {
+    char template[] = "/tmp/pap_test_claim_small_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for claim small")) {
+        return 0;
+    }
+
+    if (!assert_true(create_job_files(root, "long-job-uuid", 0), "create long job")) {
+        return 0;
+    }
+
+    char uuid[4];
+    jq_state_t state = JQ_STATE_JOBS;
+    jq_result_t claim_result = jq_claim_next(root, 0, uuid, sizeof(uuid), &state);
+    return assert_true(claim_result == JQ_ERR_INVALID_ARGUMENT, "claim rejects small uuid buffer");
 }
 
 static int test_claim_priority(void) {
@@ -420,9 +538,92 @@ static int test_release_invalid_args(void) {
                        "jq_release should reject NULL root");
 }
 
+static int test_release_missing_job(void) {
+    char template[] = "/tmp/pap_test_release_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for release missing")) {
+        return 0;
+    }
+
+    return assert_true(jq_release(root, "missing", JQ_STATE_JOBS) == JQ_ERR_NOT_FOUND,
+                       "jq_release returns not found for missing job");
+}
+
+static int test_release_invalid_state(void) {
+    char template[] = "/tmp/pap_test_release_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for release invalid")) {
+        return 0;
+    }
+
+    return assert_true(jq_release(root, "job", (jq_state_t)99) == JQ_ERR_INVALID_ARGUMENT,
+                       "jq_release rejects invalid state");
+}
+
 static int test_finalize_invalid_args(void) {
     return assert_true(jq_finalize(NULL, "job", JQ_STATE_JOBS, JQ_STATE_COMPLETE) == JQ_ERR_INVALID_ARGUMENT,
                        "jq_finalize should reject NULL root");
+}
+
+static int test_finalize_missing_job(void) {
+    char template[] = "/tmp/pap_test_finalize_missing_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for finalize missing")) {
+        return 0;
+    }
+
+    return assert_true(jq_finalize(root, "missing", JQ_STATE_JOBS, JQ_STATE_COMPLETE) == JQ_ERR_NOT_FOUND,
+                       "jq_finalize returns not found for missing job");
+}
+
+static int test_finalize_invalid_state(void) {
+    char template[] = "/tmp/pap_test_finalize_invalid_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "jq_init for finalize invalid")) {
+        return 0;
+    }
+
+    return assert_true(jq_finalize(root, "job", (jq_state_t)99, JQ_STATE_COMPLETE) == JQ_ERR_INVALID_ARGUMENT,
+                       "jq_finalize rejects invalid from state");
+}
+
+static int test_status_invalid_args(void) {
+    jq_state_t state = JQ_STATE_JOBS;
+    int locked = 0;
+    if (!assert_true(jq_status(NULL, "job", &state, &locked) == JQ_ERR_INVALID_ARGUMENT,
+                     "jq_status rejects NULL root")) {
+        return 0;
+    }
+    if (!assert_true(jq_status("/tmp", NULL, &state, &locked) == JQ_ERR_INVALID_ARGUMENT,
+                     "jq_status rejects NULL uuid")) {
+        return 0;
+    }
+    if (!assert_true(jq_status("/tmp", "job", NULL, &locked) == JQ_ERR_INVALID_ARGUMENT,
+                     "jq_status rejects NULL state_out")) {
+        return 0;
+    }
+    return assert_true(jq_status("/tmp", "job", &state, NULL) == JQ_ERR_INVALID_ARGUMENT,
+                       "jq_status rejects NULL locked_out");
 }
 
 static int test_status_unlocked_and_locked(void) {
@@ -522,20 +723,30 @@ static int test_status_partial_pair(void) {
 int main(void) {
     int passed = 1;
     passed &= test_init_invalid();
+    passed &= test_init_empty();
     passed &= test_job_paths_invalid();
     passed &= test_job_paths_overflow();
     passed &= test_submit_and_move();
     passed &= test_submit_missing_source();
+    passed &= test_submit_metadata_cleanup();
     passed &= test_move_missing_job();
+    passed &= test_move_partial_pair();
     passed &= test_submit_invalid_args();
+    passed &= test_job_paths_invalid_state();
     passed &= test_move_invalid_state();
+    passed &= test_claim_uuid_too_small();
     passed &= test_claim_priority();
     passed &= test_claim_no_jobs();
     passed &= test_release_and_finalize();
     passed &= test_claim_invalid_args();
     passed &= test_claim_skips_orphan();
     passed &= test_release_invalid_args();
+    passed &= test_release_missing_job();
+    passed &= test_release_invalid_state();
     passed &= test_finalize_invalid_args();
+    passed &= test_finalize_missing_job();
+    passed &= test_finalize_invalid_state();
+    passed &= test_status_invalid_args();
     passed &= test_status_unlocked_and_locked();
     passed &= test_status_not_found();
     passed &= test_status_partial_pair();
