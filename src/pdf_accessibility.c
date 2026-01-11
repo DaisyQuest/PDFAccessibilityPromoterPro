@@ -52,7 +52,7 @@ static void pdfa_note_issue(pdfa_report_t *report, pdfa_issue_code_t code) {
 }
 
 static void pdfa_track_text_alternatives(pdfa_report_t *report) {
-    if (!report->has_alt_text || !report->has_actual_text) {
+    if (!report->has_alt_text && !report->has_actual_text) {
         pdfa_note_issue(report, PDFA_ISSUE_MISSING_TEXT_ALTERNATIVES);
     }
 }
@@ -200,13 +200,13 @@ static void pdfa_mark_token(const char *token, size_t token_len, pdfa_report_t *
     } else if (strncmp(token, "/StructTreeRoot", token_len) == 0) {
         report->has_struct_tree_root = 1;
     } else if (strncmp(token, "/Lang", token_len) == 0) {
-        report->has_lang = 1;
+        return;
     } else if (strncmp(token, "/Alt", token_len) == 0) {
-        report->has_alt_text = 1;
+        return;
     } else if (strncmp(token, "/ActualText", token_len) == 0) {
-        report->has_actual_text = 1;
+        return;
     } else if (strncmp(token, "/Title", token_len) == 0) {
-        report->has_title = 1;
+        return;
     } else if (strncmp(token, "/RoleMap", token_len) == 0) {
         report->has_role_map = 1;
     } else if (strncmp(token, "/Metadata", token_len) == 0) {
@@ -227,8 +227,41 @@ static void pdfa_mark_token(const char *token, size_t token_len, pdfa_report_t *
 typedef enum {
     PDFA_PENDING_NONE = 0,
     PDFA_PENDING_MARKED,
-    PDFA_PENDING_DISPLAY_DOC_TITLE
+    PDFA_PENDING_DISPLAY_DOC_TITLE,
+    PDFA_PENDING_LANG_VALUE,
+    PDFA_PENDING_TITLE_VALUE,
+    PDFA_PENDING_ALT_VALUE,
+    PDFA_PENDING_ACTUAL_TEXT_VALUE
 } pdfa_pending_key_t;
+
+static int pdfa_is_value_start(int c) {
+    if (c == '/' || c == '(' || c == '<') {
+        return 1;
+    }
+    return isalnum((unsigned char)c) ? 1 : 0;
+}
+
+static void pdfa_set_value_flag(pdfa_report_t *report, pdfa_pending_key_t pending) {
+    if (!report) {
+        return;
+    }
+    switch (pending) {
+        case PDFA_PENDING_LANG_VALUE:
+            report->has_lang = 1;
+            break;
+        case PDFA_PENDING_TITLE_VALUE:
+            report->has_title = 1;
+            break;
+        case PDFA_PENDING_ALT_VALUE:
+            report->has_alt_text = 1;
+            break;
+        case PDFA_PENDING_ACTUAL_TEXT_VALUE:
+            report->has_actual_text = 1;
+            break;
+        default:
+            break;
+    }
+}
 
 static void pdfa_mark_keyword(const char *token, size_t token_len, pdfa_report_t *report, pdfa_pending_key_t *pending) {
     if (token_len == 0 || !pending) {
@@ -250,6 +283,25 @@ static void pdfa_mark_keyword(const char *token, size_t token_len, pdfa_report_t
     }
 }
 
+static void pdfa_note_pending_key(const char *token, size_t token_len, pdfa_pending_key_t *pending) {
+    if (!pending || token_len == 0) {
+        return;
+    }
+    if (strncmp(token, "/Marked", token_len) == 0) {
+        *pending = PDFA_PENDING_MARKED;
+    } else if (strncmp(token, "/DisplayDocTitle", token_len) == 0) {
+        *pending = PDFA_PENDING_DISPLAY_DOC_TITLE;
+    } else if (strncmp(token, "/Lang", token_len) == 0) {
+        *pending = PDFA_PENDING_LANG_VALUE;
+    } else if (strncmp(token, "/Title", token_len) == 0) {
+        *pending = PDFA_PENDING_TITLE_VALUE;
+    } else if (strncmp(token, "/Alt", token_len) == 0) {
+        *pending = PDFA_PENDING_ALT_VALUE;
+    } else if (strncmp(token, "/ActualText", token_len) == 0) {
+        *pending = PDFA_PENDING_ACTUAL_TEXT_VALUE;
+    }
+}
+
 static void pdfa_scan_tokens(FILE *fp, pdfa_report_t *report) {
     char buffer[PDFA_SCAN_CHUNK_SIZE + 1];
     char token[128];
@@ -267,15 +319,20 @@ static void pdfa_scan_tokens(FILE *fp, pdfa_report_t *report) {
 
         for (size_t i = 0; i < bytes; ++i) {
             char c = buffer[i];
+            if (pending == PDFA_PENDING_LANG_VALUE ||
+                pending == PDFA_PENDING_TITLE_VALUE ||
+                pending == PDFA_PENDING_ALT_VALUE ||
+                pending == PDFA_PENDING_ACTUAL_TEXT_VALUE) {
+                if (pdfa_is_value_start((unsigned char)c)) {
+                    pdfa_set_value_flag(report, pending);
+                    pending = PDFA_PENDING_NONE;
+                }
+            }
             if (c == '/') {
                 if (token_len > 0) {
                     if (token_is_name) {
                         pdfa_mark_token(token, token_len, report);
-                        if (strncmp(token, "/Marked", token_len) == 0) {
-                            pending = PDFA_PENDING_MARKED;
-                        } else if (strncmp(token, "/DisplayDocTitle", token_len) == 0) {
-                            pending = PDFA_PENDING_DISPLAY_DOC_TITLE;
-                        }
+                        pdfa_note_pending_key(token, token_len, &pending);
                     } else {
                         pdfa_mark_keyword(token, token_len, report, &pending);
                     }
@@ -295,11 +352,7 @@ static void pdfa_scan_tokens(FILE *fp, pdfa_report_t *report) {
                     } else {
                         token[token_len] = '\0';
                         pdfa_mark_token(token, token_len, report);
-                        if (strncmp(token, "/Marked", token_len) == 0) {
-                            pending = PDFA_PENDING_MARKED;
-                        } else if (strncmp(token, "/DisplayDocTitle", token_len) == 0) {
-                            pending = PDFA_PENDING_DISPLAY_DOC_TITLE;
-                        }
+                        pdfa_note_pending_key(token, token_len, &pending);
                         token_len = 0;
                         token_is_name = 0;
                     }
@@ -321,11 +374,7 @@ static void pdfa_scan_tokens(FILE *fp, pdfa_report_t *report) {
             token[token_len] = '\0';
             if (token_is_name) {
                 pdfa_mark_token(token, token_len, report);
-                if (strncmp(token, "/Marked", token_len) == 0) {
-                    pending = PDFA_PENDING_MARKED;
-                } else if (strncmp(token, "/DisplayDocTitle", token_len) == 0) {
-                    pending = PDFA_PENDING_DISPLAY_DOC_TITLE;
-                }
+                pdfa_note_pending_key(token, token_len, &pending);
             } else {
                 pdfa_mark_keyword(token, token_len, report, &pending);
             }
@@ -337,11 +386,7 @@ static void pdfa_scan_tokens(FILE *fp, pdfa_report_t *report) {
         token[token_len] = '\0';
         if (token_is_name) {
             pdfa_mark_token(token, token_len, report);
-            if (strncmp(token, "/Marked", token_len) == 0) {
-                pending = PDFA_PENDING_MARKED;
-            } else if (strncmp(token, "/DisplayDocTitle", token_len) == 0) {
-                pending = PDFA_PENDING_DISPLAY_DOC_TITLE;
-            }
+            pdfa_note_pending_key(token, token_len, &pending);
         } else {
             pdfa_mark_keyword(token, token_len, report, &pending);
         }
