@@ -1,5 +1,8 @@
 #!/bin/sh
-set -eu
+set -e
+if (set -u) 2>/dev/null; then
+    set -u
+fi
 
 ROOT_DIR="$(mktemp -d /tmp/pap_http_integration_XXXXXX)"
 PORT=9120
