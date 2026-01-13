@@ -82,6 +82,13 @@ static int write_pattern_file(const char *path, size_t bytes, unsigned char seed
     return 1;
 }
 
+static int ensure_dir(const char *path) {
+    if (mkdir(path, 0755) == 0) {
+        return 1;
+    }
+    return errno == EEXIST;
+}
+
 static int compare_files(const char *left, const char *right) {
     int left_fd = open(left, O_RDONLY);
     if (left_fd < 0) {
@@ -932,6 +939,72 @@ static int test_release_and_finalize(void) {
     return 1;
 }
 
+static int test_finalize_creates_destination_dir(void) {
+    char template[] = "/tmp/pap_test_finalize_missing_dir_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    char jobs_dir[PATH_MAX];
+    snprintf(jobs_dir, sizeof(jobs_dir), "%s/jobs", root);
+    if (!assert_true(ensure_dir(jobs_dir), "create jobs dir")) {
+        return 0;
+    }
+
+    char pdf_locked[PATH_MAX];
+    char metadata_locked[PATH_MAX];
+    if (!assert_true(build_locked_paths(root, "job-missing-dir", "jobs",
+                                        pdf_locked, sizeof(pdf_locked),
+                                        metadata_locked, sizeof(metadata_locked)),
+                     "build locked paths for missing dir finalize")) {
+        return 0;
+    }
+
+    if (!assert_true(write_file(pdf_locked, "pdf data"), "write locked pdf for missing dir finalize")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_locked, "metadata"), "write locked metadata for missing dir finalize")) {
+        return 0;
+    }
+
+    char complete_dir[PATH_MAX];
+    snprintf(complete_dir, sizeof(complete_dir), "%s/complete", root);
+    if (!assert_true(access(complete_dir, F_OK) != 0 && errno == ENOENT,
+                     "complete dir should not exist before finalize")) {
+        return 0;
+    }
+
+    jq_result_t finalize_result = jq_finalize(root, "job-missing-dir", JQ_STATE_JOBS, JQ_STATE_COMPLETE);
+    if (!assert_true(finalize_result == JQ_OK, "finalize creates destination dir")) {
+        return 0;
+    }
+
+    if (!assert_true(file_exists(complete_dir), "complete dir exists after finalize")) {
+        return 0;
+    }
+
+    char pdf_complete[PATH_MAX];
+    char metadata_complete[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "job-missing-dir", JQ_STATE_COMPLETE,
+                                  pdf_complete, sizeof(pdf_complete),
+                                  metadata_complete, sizeof(metadata_complete)) == JQ_OK,
+                     "complete paths after finalize missing dir")) {
+        return 0;
+    }
+
+    if (!assert_true(file_exists(pdf_complete), "finalized pdf exists missing dir")) {
+        return 0;
+    }
+    if (!assert_true(file_exists(metadata_complete), "finalized metadata exists missing dir")) {
+        return 0;
+    }
+
+    return assert_true(!file_exists(pdf_locked), "locked pdf moved on finalize missing dir") &&
+           assert_true(!file_exists(metadata_locked), "locked metadata moved on finalize missing dir");
+}
+
 static int test_release_rolls_back_on_missing_metadata(void) {
     char template[] = "/tmp/pap_test_release_partial_XXXXXX";
     char *root = mkdtemp(template);
@@ -1432,6 +1505,7 @@ int main(void) {
     passed &= test_claim_priority();
     passed &= test_claim_no_jobs();
     passed &= test_release_and_finalize();
+    passed &= test_finalize_creates_destination_dir();
     passed &= test_release_rolls_back_on_missing_metadata();
     passed &= test_claim_invalid_args();
     passed &= test_claim_skips_orphan();

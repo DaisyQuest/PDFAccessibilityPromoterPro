@@ -43,6 +43,25 @@ static jq_result_t jq_ensure_dir(const char *path) {
     return JQ_ERR_IO;
 }
 
+static jq_result_t jq_ensure_state_dir(const char *root_path, jq_state_t state) {
+    if (!root_path) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    const char *dir = jq_state_dir(state);
+    if (!dir) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%s", root_path, dir);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    return jq_ensure_dir(path);
+}
+
 jq_result_t jq_init(const char *root_path) {
     if (!root_path || root_path[0] == '\0') {
         return JQ_ERR_INVALID_ARGUMENT;
@@ -390,6 +409,11 @@ jq_result_t jq_move(const char *root_path,
                     jq_state_t to_state) {
     if (!root_path || !uuid) {
         return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    jq_result_t ensure_result = jq_ensure_state_dir(root_path, to_state);
+    if (ensure_result != JQ_OK) {
+        return ensure_result;
     }
 
     char pdf_src[PATH_MAX];
@@ -814,6 +838,11 @@ jq_result_t jq_release(const char *root_path,
         return JQ_ERR_INVALID_ARGUMENT;
     }
 
+    jq_result_t ensure_result = jq_ensure_state_dir(root_path, state);
+    if (ensure_result != JQ_OK) {
+        return ensure_result;
+    }
+
     char pdf_locked[PATH_MAX];
     char metadata_locked[PATH_MAX];
     char pdf_dest[PATH_MAX];
@@ -874,6 +903,11 @@ jq_result_t jq_finalize(const char *root_path,
                         jq_state_t to_state) {
     if (!root_path || !uuid) {
         return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    jq_result_t ensure_result = jq_ensure_state_dir(root_path, to_state);
+    if (ensure_result != JQ_OK) {
+        return ensure_result;
     }
 
     char pdf_locked[PATH_MAX];

@@ -55,6 +55,7 @@
 - [x] Unit tests complete.
 - [x] Integration tests complete.
 - [x] Redaction PII detection test coverage added.
+- [x] Job finalization missing-directory regression test added.
 - [ ] System tests complete.
 - [ ] Coverage ≥ 90% achieved.
 - [ ] Full branch coverage documented.
