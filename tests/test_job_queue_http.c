@@ -11,7 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define RESPONSE_BUFFER 4096
+#define RESPONSE_BUFFER 65536
 #define COMMAND_BUFFER 16384
 
 static int assert_true(int condition, const char *message) {
@@ -1160,6 +1160,102 @@ static int test_http_metrics(void) {
     return 1;
 }
 
+static int test_http_panel_page(void) {
+    char template[] = "/tmp/pap_test_http_panel_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for panel")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9117;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for panel")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char output[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/panel", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "panel request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "Job Queue Monitor") != NULL, "panel page title")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "/metrics") != NULL, "panel metrics link")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "root panel request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "Job Queue Monitor") != NULL, "root panel title")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_panel_auth(void) {
+    char template[] = "/tmp/pap_test_http_panel_auth_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for panel auth")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9118;
+    const char *token = "panel-token";
+    if (!assert_true(start_server(root, port, token, &pid), "start server for panel auth")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char status_buffer[64];
+    snprintf(command, sizeof(command),
+             "curl -s -w \"%s\" -o /dev/null http://127.0.0.1:%d/panel",
+             "%{http_code}", port);
+    if (!assert_true(read_http_status(command, status_buffer, sizeof(status_buffer)), "panel no token")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(status_buffer, "401") != NULL, "panel unauthorized 401")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char output[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/panel?token=%s", port, token);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "panel with token")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, token) != NULL, "panel includes token")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_http_submit_claim_finalize();
@@ -1181,6 +1277,8 @@ int main(void) {
     passed &= test_http_url_decoding();
     passed &= test_http_invalid_uuid_and_path();
     passed &= test_http_metrics();
+    passed &= test_http_panel_page();
+    passed &= test_http_panel_auth();
 
     if (!passed) {
         fprintf(stderr, "Some HTTP tests failed.\n");

@@ -34,3 +34,22 @@ You can also collect stats directly from disk:
 ```sh
 ./job_queue_cli stats <root>
 ```
+
+## Monitoring panel
+
+The HTTP server includes a built-in monitoring panel at `/panel` (and `/`). It refreshes every few seconds and uses the same token settings as the JSON metrics endpoint.
+
+```sh
+./job_queue_http <root> <port>
+open http://127.0.0.1:<port>/panel
+```
+
+## One-click local launcher
+
+Use the launcher scripts to spin up the server and open the monitoring panel for local testing:
+
+```sh
+./launch_panel.sh [root] [port]
+```
+
+Windows equivalents are available as `launch_panel.bat` and `launch_panel.ps1`.
