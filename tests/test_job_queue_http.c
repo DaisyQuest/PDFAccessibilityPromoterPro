@@ -110,6 +110,45 @@ static void stop_server(pid_t pid) {
     waitpid(pid, NULL, 0);
 }
 
+static int extract_json_value(const char *json, const char *key, char *output, size_t output_len) {
+    if (!json || !key || !output || output_len == 0) {
+        return 0;
+    }
+    char needle[128];
+    int written = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (written < 0 || (size_t)written >= sizeof(needle)) {
+        return 0;
+    }
+    const char *start = strstr(json, needle);
+    if (!start) {
+        return 0;
+    }
+    start += strlen(needle);
+    const char *end = strchr(start, '"');
+    if (!end) {
+        return 0;
+    }
+    size_t len = (size_t)(end - start);
+    if (len + 1 > output_len) {
+        return 0;
+    }
+    memcpy(output, start, len);
+    output[len] = '\0';
+    return 1;
+}
+
+static int extract_json_value_after(const char *json,
+                                    const char *marker,
+                                    const char *key,
+                                    char *output,
+                                    size_t output_len) {
+    const char *start = strstr(json, marker);
+    if (!start) {
+        return 0;
+    }
+    return extract_json_value(start, key, output, output_len);
+}
+
 static int test_http_submit_claim_finalize(void) {
     char template[] = "/tmp/pap_test_http_XXXXXX";
     char *root = mkdtemp(template);
@@ -457,6 +496,111 @@ static int test_http_submit_missing_file(void) {
     }
 
     if (!assert_true(strstr(status_buffer, "404") != NULL, "submit missing file status 404")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_upload_submit(void) {
+    char template[] = "/tmp/pap_test_http_upload_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for upload")) {
+        return 0;
+    }
+
+    char pdf_path[PATH_MAX];
+    snprintf(pdf_path, sizeof(pdf_path), "%s/source.pdf", root);
+    const char *pdf_contents = "%PDF-1.7\n1 0 obj\n<<>>\nendobj\n";
+    if (!assert_true(write_file(pdf_path, pdf_contents), "write upload pdf")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9120;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for upload")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char response[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command),
+             "curl -s -X POST "
+             "-F \"pdf=@%s\" "
+             "-F \"output_dir=uploads/ui\" "
+             "-F \"label=upload\" "
+             "-F \"priority=1\" "
+             "-F \"redact=1\" "
+             "-F \"redactions=SECRET\" "
+             "http://127.0.0.1:%d/upload",
+             pdf_path, port);
+
+    if (!assert_true(read_command_output(command, response, sizeof(response)), "upload request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(response, "\"status\":\"ok\"") != NULL, "upload status ok")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char ocr_uuid[128];
+    if (!assert_true(extract_json_value(response, "ocr_uuid", ocr_uuid, sizeof(ocr_uuid)),
+                     "extract ocr uuid")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char redact_uuid[128];
+    if (!assert_true(extract_json_value_after(response, "\"redact\":", "uuid", redact_uuid, sizeof(redact_uuid)),
+                     "extract redact uuid")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char upload_dir[256];
+    snprintf(upload_dir, sizeof(upload_dir), "%s/uploads/ui", root);
+    char pdf_uploaded[512];
+    char ocr_metadata[512];
+    snprintf(pdf_uploaded, sizeof(pdf_uploaded), "%s/%s.pdf", upload_dir, ocr_uuid);
+    snprintf(ocr_metadata, sizeof(ocr_metadata), "%s/%s.metadata.json", upload_dir, ocr_uuid);
+    if (!assert_true(file_exists(pdf_uploaded), "uploaded pdf exists")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(ocr_metadata), "ocr metadata exists")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char redact_metadata[512];
+    snprintf(redact_metadata, sizeof(redact_metadata), "%s/%s.metadata.json", upload_dir, redact_uuid);
+    if (!assert_true(file_exists(redact_metadata), "redact metadata exists")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char pdf_job[PATH_MAX];
+    char metadata_job[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, ocr_uuid, JQ_STATE_PRIORITY,
+                                  pdf_job, sizeof(pdf_job),
+                                  metadata_job, sizeof(metadata_job)) == JQ_OK,
+                     "ocr job paths priority")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(pdf_job), "ocr job pdf queued")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(metadata_job), "ocr job metadata queued")) {
         stop_server(pid);
         return 0;
     }
@@ -1193,6 +1337,10 @@ static int test_http_panel_page(void) {
         stop_server(pid);
         return 0;
     }
+    if (!assert_true(strstr(output, "Submit OCR") != NULL, "panel upload form")) {
+        stop_server(pid);
+        return 0;
+    }
 
     snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/", port);
     if (!assert_true(read_command_output(command, output, sizeof(output)), "root panel request")) {
@@ -1200,6 +1348,10 @@ static int test_http_panel_page(void) {
         return 0;
     }
     if (!assert_true(strstr(output, "Job Queue Monitor") != NULL, "root panel title")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "Submit OCR") != NULL, "root panel upload form")) {
         stop_server(pid);
         return 0;
     }
@@ -1264,6 +1416,7 @@ int main(void) {
     passed &= test_http_invalid_method_and_not_found();
     passed &= test_http_missing_params();
     passed &= test_http_submit_missing_file();
+    passed &= test_http_upload_submit();
     passed &= test_http_claim_empty();
     passed &= test_http_move_endpoint();
     passed &= test_http_status_missing_uuid();
