@@ -120,7 +120,101 @@ static int test_scan_success(void) {
     return assert_true(report.pdf_version_major == 1, "pdf version major") &&
            assert_true(report.pdf_version_minor == 7, "pdf version minor") &&
            assert_true(report.bytes_scanned == expected_size, "bytes scanned matches file size") &&
-           assert_true(report.provider_name != NULL, "provider name set");
+           assert_true(report.provider_name != NULL, "provider name set") &&
+           assert_true(report.handwriting_marker_hits == 0, "handwriting markers default to zero") &&
+           assert_true(report.handwriting_confidence == 0, "handwriting confidence default to zero");
+}
+
+static int test_scan_handwriting_markers(void) {
+    char template[] = "/tmp/pap_ocr_handwriting_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char path[PATH_MAX];
+    const char *contents =
+        "%PDF-1.7\n"
+        "1 0 obj\n"
+        "<< /Subtype/Ink /Annots [ << /Sig /Signature >> ] /Contents (Handwriting) >>\n"
+        "endobj\n";
+    snprintf(path, sizeof(path), "%s/ink.pdf", root);
+    if (!assert_true(write_file(path, contents), "write ink pdf")) {
+        return 0;
+    }
+
+    pocr_report_t report;
+    if (!assert_true(pocr_scan_file(path, &report) == POCR_OK, "pocr_scan_file handwriting success")) {
+        return 0;
+    }
+
+    return assert_true(report.handwriting_marker_hits > 0, "handwriting markers detected") &&
+           assert_true(report.handwriting_confidence == 100, "handwriting confidence capped at 100");
+}
+
+static int test_scan_handwriting_case_insensitive(void) {
+    char template[] = "/tmp/pap_ocr_handwriting_case_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char path[PATH_MAX];
+    const char *contents =
+        "%PDF-1.7\n"
+        "1 0 obj\n"
+        "<< /Contents (hAnDwRiTtEn) iNkLiSt [1 2 3] >>\n"
+        "endobj\n";
+    snprintf(path, sizeof(path), "%s/case.pdf", root);
+    if (!assert_true(write_file(path, contents), "write case pdf")) {
+        return 0;
+    }
+
+    pocr_report_t report;
+    if (!assert_true(pocr_scan_file(path, &report) == POCR_OK, "pocr_scan_file case success")) {
+        return 0;
+    }
+
+    return assert_true(report.handwriting_marker_hits >= 2, "case-insensitive markers detected") &&
+           assert_true(report.handwriting_confidence == 75, "case-insensitive confidence computed");
+}
+
+static int test_scan_handwriting_boundary(void) {
+    char template[] = "/tmp/pap_ocr_handwriting_boundary_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+    char path[PATH_MAX];
+    const char *header = "%PDF-1.7\n";
+    size_t header_len = strlen(header);
+    size_t filler_len = 4093 - header_len;
+    size_t token_len = strlen("InkList");
+    char *contents = malloc(filler_len + token_len + header_len + 16);
+    if (!contents) {
+        return assert_true(0, "malloc filler failed");
+    }
+    memcpy(contents, header, header_len);
+    memset(contents + header_len, 'A', filler_len);
+    memcpy(contents + header_len + filler_len, "InkList", token_len);
+    memcpy(contents + header_len + filler_len + token_len, "\n", 2);
+    contents[header_len + filler_len + token_len + 1] = '\0';
+
+    snprintf(path, sizeof(path), "%s/boundary.pdf", root);
+    int wrote = write_file(path, contents);
+    free(contents);
+    if (!assert_true(wrote, "write boundary pdf")) {
+        return 0;
+    }
+
+    pocr_report_t report;
+    if (!assert_true(pocr_scan_file(path, &report) == POCR_OK, "pocr_scan_file boundary success")) {
+        return 0;
+    }
+
+    return assert_true(report.handwriting_marker_hits >= 1, "boundary marker detected") &&
+           assert_true(report.handwriting_confidence == 30, "boundary confidence computed");
 }
 
 static int test_report_to_json(void) {
@@ -152,6 +246,8 @@ static int test_report_to_json_success(void) {
     report.pdf_version_minor = 6;
     report.bytes_scanned = 120;
     report.provider_name = "custom";
+    report.handwriting_confidence = 75;
+    report.handwriting_marker_hits = 3;
 
     char buffer[256];
     size_t written = 0;
@@ -162,8 +258,160 @@ static int test_report_to_json_success(void) {
     buffer[written] = '\0';
     return assert_true(strstr(buffer, "\"ocr_status\":\"complete\"") != NULL, "contains status") &&
            assert_true(strstr(buffer, "\"ocr_provider\":\"custom\"") != NULL, "contains provider") &&
+           assert_true(strstr(buffer, "\"handwriting_detected\":true") != NULL, "contains handwriting detected") &&
+           assert_true(strstr(buffer, "\"handwriting_confidence\":75") != NULL, "contains handwriting confidence") &&
+           assert_true(strstr(buffer, "\"handwriting_markers\":3") != NULL, "contains handwriting markers") &&
            assert_true(strstr(buffer, "\"pdf_version\":\"1.6\"") != NULL, "contains version") &&
            assert_true(strstr(buffer, "\"bytes_scanned\":120") != NULL, "contains bytes");
+}
+
+static int test_report_to_json_no_handwriting(void) {
+    pocr_report_t report;
+    if (!assert_true(pocr_report_init(&report) == POCR_OK, "init report")) {
+        return 0;
+    }
+    report.pdf_version_major = 1;
+    report.pdf_version_minor = 5;
+    report.bytes_scanned = 10;
+    report.provider_name = "custom";
+
+    char buffer[256];
+    size_t written = 0;
+    if (!assert_true(pocr_report_to_json(&report, buffer, sizeof(buffer), &written) == POCR_OK,
+                     "report_to_json no handwriting success")) {
+        return 0;
+    }
+    buffer[written] = '\0';
+    return assert_true(strstr(buffer, "\"handwriting_detected\":false") != NULL, "contains handwriting false") &&
+           assert_true(strstr(buffer, "\"handwriting_confidence\":0") != NULL, "contains handwriting confidence zero") &&
+           assert_true(strstr(buffer, "\"handwriting_markers\":0") != NULL, "contains handwriting markers zero");
+}
+
+typedef struct {
+    const char *name;
+    const char *contents;
+    int expected_handwriting;
+    unsigned int min_confidence;
+    unsigned int max_confidence;
+} handwriting_sample_t;
+
+static int test_handwriting_evaluation(void) {
+    handwriting_sample_t samples[] = {
+        {
+            .name = "ink-annotation",
+            .contents =
+                "%PDF-1.7\n"
+                "1 0 obj\n"
+                "<< /Subtype/Ink /Annot >>\n"
+                "endobj\n",
+            .expected_handwriting = 1,
+            .min_confidence = 50,
+            .max_confidence = 100
+        },
+        {
+            .name = "signature-text",
+            .contents =
+                "%PDF-1.7\n"
+                "1 0 obj\n"
+                "<< /Sig /Contents (Handwritten) >>\n"
+                "endobj\n",
+            .expected_handwriting = 1,
+            .min_confidence = 60,
+            .max_confidence = 100
+        },
+        {
+            .name = "inklist-mixed",
+            .contents =
+                "%PDF-1.7\n"
+                "1 0 obj\n"
+                "<< InkList [ 1 2 3 ] /Contents (Handwriting) >>\n"
+                "endobj\n",
+            .expected_handwriting = 1,
+            .min_confidence = 60,
+            .max_confidence = 100
+        },
+        {
+            .name = "typed-only",
+            .contents =
+                "%PDF-1.7\n"
+                "1 0 obj\n"
+                "<< /Contents (Typed text) >>\n"
+                "endobj\n",
+            .expected_handwriting = 0,
+            .min_confidence = 0,
+            .max_confidence = 0
+        },
+        {
+            .name = "vector-only",
+            .contents =
+                "%PDF-1.7\n"
+                "1 0 obj\n"
+                "<< /XObject << /Im0 2 0 R >> >>\n"
+                "endobj\n",
+            .expected_handwriting = 0,
+            .min_confidence = 0,
+            .max_confidence = 0
+        }
+    };
+
+    char template[] = "/tmp/pap_ocr_eval_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    size_t true_positive = 0;
+    size_t false_positive = 0;
+    size_t true_negative = 0;
+    size_t false_negative = 0;
+    const unsigned int threshold = 30;
+
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s.pdf", root, samples[i].name);
+        if (!assert_true(write_file(path, samples[i].contents), "write evaluation pdf")) {
+            return 0;
+        }
+
+        pocr_report_t report;
+        if (!assert_true(pocr_scan_file(path, &report) == POCR_OK, "pocr_scan_file evaluation success")) {
+            return 0;
+        }
+
+        int predicted = report.handwriting_confidence >= threshold;
+        if (predicted && samples[i].expected_handwriting) {
+            true_positive++;
+        } else if (predicted && !samples[i].expected_handwriting) {
+            false_positive++;
+        } else if (!predicted && !samples[i].expected_handwriting) {
+            true_negative++;
+        } else {
+            false_negative++;
+        }
+
+        if (!assert_true(report.handwriting_confidence >= samples[i].min_confidence,
+                         "confidence meets minimum")) {
+            return 0;
+        }
+        if (!assert_true(report.handwriting_confidence <= samples[i].max_confidence,
+                         "confidence below maximum")) {
+            return 0;
+        }
+    }
+
+    double precision = 0.0;
+    double recall = 0.0;
+    if (true_positive + false_positive > 0) {
+        precision = (double)true_positive / (double)(true_positive + false_positive);
+    }
+    if (true_positive + false_negative > 0) {
+        recall = (double)true_positive / (double)(true_positive + false_negative);
+    }
+
+    return assert_true(precision >= 0.9, "handwriting precision meets target") &&
+           assert_true(recall >= 0.9, "handwriting recall meets target") &&
+           assert_true(true_negative >= 1, "handwriting true negatives present");
 }
 
 static int test_result_str(void) {
@@ -293,8 +541,13 @@ int main(void) {
     passed &= test_scan_provider_missing();
     passed &= test_scan_parse_error();
     passed &= test_scan_success();
+    passed &= test_scan_handwriting_markers();
+    passed &= test_scan_handwriting_case_insensitive();
+    passed &= test_scan_handwriting_boundary();
     passed &= test_report_to_json();
     passed &= test_report_to_json_success();
+    passed &= test_report_to_json_no_handwriting();
+    passed &= test_handwriting_evaluation();
     passed &= test_result_str();
     passed &= test_provider_registry_invalid();
     passed &= test_provider_registry_duplicate();

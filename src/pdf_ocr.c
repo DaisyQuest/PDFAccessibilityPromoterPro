@@ -33,6 +33,12 @@ static pocr_result_t pocr_scan_version(FILE *fp, pocr_report_t *report) {
 }
 
 #define POCR_MAX_PROVIDERS 16
+#define POCR_MARKER_SCAN_CHUNK 4096
+
+typedef struct {
+    const char *token;
+    int weight;
+} pocr_marker_t;
 
 static pocr_provider_t pocr_providers[POCR_MAX_PROVIDERS];
 static size_t pocr_provider_count_value = 0;
@@ -109,6 +115,188 @@ static void pocr_log_message(pocr_log_level_t level, const char *format, ...) {
     fprintf(stderr, "[OCR][%s] %s\n", pocr_log_level_str_internal(level), buffer);
 }
 
+static int pocr_chars_equal_ci(char left, char right) {
+    return tolower((unsigned char)left) == tolower((unsigned char)right);
+}
+
+static size_t pocr_count_marker_hits_window(const char *buffer,
+                                            size_t buffer_len,
+                                            const char *needle,
+                                            size_t needle_len,
+                                            size_t carry_len) {
+    if (!buffer || !needle || needle_len == 0 || buffer_len < needle_len) {
+        return 0;
+    }
+
+    size_t hits = 0;
+    for (size_t i = 0; i + needle_len <= buffer_len; ++i) {
+        size_t j = 0;
+        for (; j < needle_len; ++j) {
+            if (!pocr_chars_equal_ci(buffer[i + j], needle[j])) {
+                break;
+            }
+        }
+        if (j == needle_len) {
+            if (i + needle_len > carry_len) {
+                hits++;
+            }
+            i += needle_len - 1;
+        }
+    }
+    return hits;
+}
+
+static void pocr_scan_handwriting_markers(FILE *fp, pocr_report_t *report) {
+    static const pocr_marker_t markers[] = {
+        { "/Subtype/Ink", 45 },
+        { "InkList", 30 },
+        { "/Ink", 20 },
+        { "/Sig", 25 },
+        { "Signature", 25 },
+        { "Handwriting", 35 },
+        { "Handwritten", 35 },
+        { "/FreeText", 15 },
+        { "/Stamp", 10 },
+        { "/Annot", 10 },
+        { "/Annots", 10 }
+    };
+
+    if (!fp || !report) {
+        return;
+    }
+
+    size_t max_marker_len = 0;
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+        size_t len = strlen(markers[i].token);
+        if (len > max_marker_len) {
+            max_marker_len = len;
+        }
+    }
+
+    if (max_marker_len == 0) {
+        report->handwriting_marker_hits = 0;
+        report->handwriting_confidence = 0;
+        return;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        report->handwriting_marker_hits = 0;
+        report->handwriting_confidence = 0;
+        return;
+    }
+
+    char chunk[POCR_MARKER_SCAN_CHUNK];
+    size_t window_cap = POCR_MARKER_SCAN_CHUNK + max_marker_len;
+    char *window = malloc(window_cap);
+    char *carry = NULL;
+    size_t carry_len = 0;
+    if (max_marker_len > 0) {
+        carry = malloc(max_marker_len);
+    }
+    if (!window || (max_marker_len > 0 && !carry)) {
+        free(window);
+        free(carry);
+        report->handwriting_marker_hits = 0;
+        report->handwriting_confidence = 0;
+        return;
+    }
+    size_t marker_hits[sizeof(markers) / sizeof(markers[0])];
+    memset(marker_hits, 0, sizeof(marker_hits));
+
+    size_t read_bytes = 0;
+    while ((read_bytes = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        size_t window_len = 0;
+        if (carry_len > 0) {
+            memcpy(window, carry, carry_len);
+            window_len = carry_len;
+        }
+        memcpy(window + window_len, chunk, read_bytes);
+        window_len += read_bytes;
+
+        for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+            marker_hits[i] += pocr_count_marker_hits_window(window,
+                                                            window_len,
+                                                            markers[i].token,
+                                                            strlen(markers[i].token),
+                                                            carry_len);
+        }
+
+        if (window_len >= max_marker_len) {
+            carry_len = max_marker_len - 1;
+            memcpy(carry, window + window_len - carry_len, carry_len);
+        } else {
+            carry_len = window_len;
+            memcpy(carry, window, carry_len);
+        }
+    }
+    free(window);
+    free(carry);
+
+    size_t total_hits = 0;
+    unsigned int score = 0;
+    int has_ink = 0;
+    int has_signature = 0;
+    int has_text = 0;
+    int has_annotation = 0;
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+        total_hits += marker_hits[i];
+        if (marker_hits[i] > 0) {
+            score += (unsigned int)markers[i].weight;
+        }
+        if (marker_hits[i] > 1) {
+            score += (unsigned int)(markers[i].weight / 2);
+        }
+        if (marker_hits[i] > 2) {
+            score += (unsigned int)(markers[i].weight / 4);
+        }
+
+        if (marker_hits[i] > 0) {
+            if (strcmp(markers[i].token, "/Subtype/Ink") == 0 ||
+                strcmp(markers[i].token, "InkList") == 0 ||
+                strcmp(markers[i].token, "/Ink") == 0) {
+                has_ink = 1;
+            } else if (strcmp(markers[i].token, "/Sig") == 0 ||
+                       strcmp(markers[i].token, "Signature") == 0) {
+                has_signature = 1;
+            } else if (strcmp(markers[i].token, "Handwriting") == 0 ||
+                       strcmp(markers[i].token, "Handwritten") == 0) {
+                has_text = 1;
+            } else if (strcmp(markers[i].token, "/Annot") == 0 ||
+                       strcmp(markers[i].token, "/Annots") == 0 ||
+                       strcmp(markers[i].token, "/FreeText") == 0 ||
+                       strcmp(markers[i].token, "/Stamp") == 0) {
+                has_annotation = 1;
+            }
+        }
+    }
+
+    if (total_hits == 0) {
+        report->handwriting_marker_hits = 0;
+        report->handwriting_confidence = 0;
+        return;
+    }
+
+    if (has_ink && has_signature) {
+        score += 10;
+    }
+    if (has_ink && has_text) {
+        score += 10;
+    }
+    if (has_signature && has_text) {
+        score += 5;
+    }
+    if (has_annotation && (has_ink || has_signature)) {
+        score += 5;
+    }
+
+    if (score > 100) {
+        score = 100;
+    }
+
+    report->handwriting_marker_hits = total_hits;
+    report->handwriting_confidence = score;
+}
+
 static pocr_result_t pocr_register_provider_internal(const pocr_provider_t *provider, int log_errors) {
     if (!provider || !provider->name || provider->name[0] == '\0' || !provider->scan_file) {
         if (log_errors) {
@@ -158,6 +346,7 @@ static pocr_result_t pocr_builtin_scan(const char *path, pocr_report_t *report, 
     }
 
     pocr_result_t version_result = pocr_scan_version(fp, report);
+    pocr_scan_handwriting_markers(fp, report);
     fclose(fp);
     return version_result;
 }
@@ -183,6 +372,8 @@ pocr_result_t pocr_report_init(pocr_report_t *report) {
     report->pdf_version_major = -1;
     report->pdf_version_minor = -1;
     report->provider_name = NULL;
+    report->handwriting_marker_hits = 0;
+    report->handwriting_confidence = 0;
     return POCR_OK;
 }
 
@@ -241,14 +432,21 @@ pocr_result_t pocr_report_to_json(const pocr_report_t *report,
     }
 
     const char *provider = report->provider_name ? report->provider_name : "unknown";
+    const char *handwriting_detected = report->handwriting_confidence > 0 ? "true" : "false";
     int written = snprintf(buffer, buffer_len,
                            "{"
                            "\"ocr_status\":\"complete\","
                            "\"ocr_provider\":\"%s\","
+                           "\"handwriting_detected\":%s,"
+                           "\"handwriting_confidence\":%u,"
+                           "\"handwriting_markers\":%zu,"
                            "\"pdf_version\":\"%d.%d\","
                            "\"bytes_scanned\":%zu"
                            "}",
                            provider,
+                           handwriting_detected,
+                           report->handwriting_confidence,
+                           report->handwriting_marker_hits,
                            report->pdf_version_major,
                            report->pdf_version_minor,
                            report->bytes_scanned);
