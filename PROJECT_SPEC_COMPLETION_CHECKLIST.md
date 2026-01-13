@@ -64,3 +64,4 @@
 - [x] Cross-platform server demo scripts added.
 - [x] Makefile job processor shortcuts added.
 - [x] Local monitoring panel and launcher scripts added.
+- [x] Control panel can trigger worker jobs for local development.

@@ -34,6 +34,7 @@
 #define HTTP_MAX_CHILDREN 32
 #define HTTP_METRICS_BUFFER 16384
 #define HTTP_PANEL_BUFFER 65536
+#define HTTP_WORKER_OUTPUT_BUFFER 8192
 
 typedef enum {
     READ_OK = 0,
@@ -49,6 +50,8 @@ static void trim_token(char *value);
 static volatile sig_atomic_t active_children = 0;
 static struct timespec server_start_time;
 static int server_start_set = 0;
+static char server_exe_dir[PATH_MAX];
+static int server_exe_dir_set = 0;
 
 static void record_server_start(void) {
     if (!server_start_set) {
@@ -405,6 +408,122 @@ static int json_escape(const char *input, char *output, size_t output_len) {
     return 1;
 }
 
+static int parse_bool_param(const char *value) {
+    if (!value || value[0] == '\0') {
+        return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+        return 1;
+    }
+    if (strcasecmp(value, "true") == 0) {
+        return 1;
+    }
+    if (strcasecmp(value, "yes") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+typedef enum {
+    WORKER_OCR = 0,
+    WORKER_REDACT = 1,
+    WORKER_ANALYZE = 2
+} worker_kind_t;
+
+static const char *worker_kind_label(worker_kind_t kind) {
+    switch (kind) {
+        case WORKER_OCR:
+            return "ocr";
+        case WORKER_REDACT:
+            return "redact";
+        case WORKER_ANALYZE:
+            return "analyze";
+        default:
+            return "unknown";
+    }
+}
+
+static const char *worker_binary_name(worker_kind_t kind) {
+    switch (kind) {
+        case WORKER_OCR:
+            return "job_queue_ocr";
+        case WORKER_REDACT:
+            return "job_queue_redact";
+        case WORKER_ANALYZE:
+            return "job_queue_analyze";
+        default:
+            return "job_queue_unknown";
+    }
+}
+
+static int parse_worker_kind(const char *value, worker_kind_t *out_kind) {
+    if (!value || !out_kind) {
+        return 0;
+    }
+    if (strcmp(value, "ocr") == 0) {
+        *out_kind = WORKER_OCR;
+        return 1;
+    }
+    if (strcmp(value, "redact") == 0 || strcmp(value, "redaction") == 0) {
+        *out_kind = WORKER_REDACT;
+        return 1;
+    }
+    if (strcmp(value, "analyze") == 0 || strcmp(value, "analysis") == 0) {
+        *out_kind = WORKER_ANALYZE;
+        return 1;
+    }
+    return 0;
+}
+
+static int build_worker_path(const char *exe_dir, const char *binary, char *out, size_t out_len) {
+    if (!binary || !out || out_len == 0) {
+        return 0;
+    }
+    if (!exe_dir || exe_dir[0] == '\0') {
+        return snprintf(out, out_len, "%s", binary) > 0;
+    }
+    int written = snprintf(out, out_len, "%s/%s", exe_dir, binary);
+    if (written < 0 || (size_t)written >= out_len) {
+        return 0;
+    }
+    return 1;
+}
+
+static int resolve_executable_dir(const char *argv0, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return 0;
+    }
+    char path[PATH_MAX];
+    path[0] = '\0';
+#if defined(__linux__)
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (len > 0) {
+        path[len] = '\0';
+    }
+#endif
+    if (path[0] == '\0' && argv0 && argv0[0] != '\0') {
+        if (!realpath(argv0, path)) {
+            snprintf(path, sizeof(path), "%s", argv0);
+        }
+    }
+    if (path[0] == '\0') {
+        return 0;
+    }
+    char *slash = strrchr(path, '/');
+    if (!slash) {
+        return 0;
+    }
+    *slash = '\0';
+    if (path[0] == '\0') {
+        return 0;
+    }
+    if (strlen(path) + 1 > out_len) {
+        return 0;
+    }
+    snprintf(out, out_len, "%s", path);
+    return 1;
+}
+
 static const char *find_bytes(const char *haystack,
                               size_t haystack_len,
                               const char *needle,
@@ -645,6 +764,14 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
         ".form-footer{margin-top:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;}"
         ".result{margin-top:16px;padding:12px;border-radius:12px;background:#eef2ff;color:#1e293b;font-size:13px;}"
         ".result code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;}"
+        ".worker-panel{margin-top:24px;background:#f8fafc;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(15,23,42,.25);}"
+        ".worker-panel h2{margin:0 0 8px;font-size:20px;color:#0f172a;}"
+        ".worker-panel p{margin:0 0 16px;color:#64748b;}"
+        ".worker-actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center;}"
+        ".worker-options{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;color:#475569;}"
+        ".worker-options label{display:flex;align-items:center;gap:6px;}"
+        ".worker-output{margin-top:16px;padding:12px;border-radius:12px;background:#f1f5f9;color:#1e293b;"
+        "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;}"
         "</style></head><body><div class=\"wrap\">"
         "<section class=\"hero\"><div>"
         "<h1>Job Queue Monitor</h1>"
@@ -725,6 +852,21 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
         "</form>"
         "<div id=\"resultBox\" class=\"result\" hidden></div>"
         "</section>"
+        "<section class=\"worker-panel\">"
+        "<h2>Run worker jobs</h2>"
+        "<p>Launch any worker against the queue to surface OCR, redaction, and analysis output quickly.</p>"
+        "<div class=\"worker-actions\">"
+        "<button type=\"button\" data-worker=\"ocr\">Run OCR worker</button>"
+        "<button type=\"button\" data-worker=\"redact\">Run Redaction worker</button>"
+        "<button type=\"button\" data-worker=\"analyze\">Run Analysis worker</button>"
+        "<span id=\"workerStatus\" class=\"pill\">Idle</span>"
+        "</div>"
+        "<div class=\"worker-options\">"
+        "<label><input id=\"workerPreferPriority\" type=\"checkbox\">Prefer priority queue</label>"
+        "<label><input id=\"workerNoHtml\" type=\"checkbox\">Skip analysis HTML report</label>"
+        "</div>"
+        "<div id=\"workerOutput\" class=\"worker-output\" hidden></div>"
+        "</section>"
         "</div><script>"
     };
     for (size_t i = 0; i < sizeof(chunks) / sizeof(chunks[0]); ++i) {
@@ -746,7 +888,12 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
                      "const submitStatus = document.getElementById('submitStatus');"
                      "const resultBox = document.getElementById('resultBox');"
                      "const redactionToggle = document.getElementById('redactToggle');"
-                     "const redactionsInput = document.getElementById('redactionsInput');",
+                     "const redactionsInput = document.getElementById('redactionsInput');"
+                     "const workerButtons = document.querySelectorAll('[data-worker]');"
+                     "const workerStatus = document.getElementById('workerStatus');"
+                     "const workerOutput = document.getElementById('workerOutput');"
+                     "const workerPrefer = document.getElementById('workerPreferPriority');"
+                     "const workerNoHtml = document.getElementById('workerNoHtml');",
                      escaped_token)) {
         return 0;
     }
@@ -791,6 +938,14 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
                      "function showResult(html){"
                      "resultBox.innerHTML=html;"
                      "resultBox.hidden=false;"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "function setWorkerStatus(text, isError){"
+                     "workerStatus.textContent=text;"
+                     "workerStatus.style.background=isError ? '#fee2e2' : '#e2e8f0';"
+                     "workerStatus.style.color=isError ? '#991b1b' : '#1e293b';"
                      "}")) {
         return 0;
     }
@@ -843,6 +998,41 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
                      "}finally{submitBtn.disabled=false;}"
                      "});"
                      "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "async function runWorker(kind){"
+                     "const params=new URLSearchParams();"
+                     "params.set('job', kind);"
+                     "if(workerPrefer && workerPrefer.checked){params.set('prefer_priority','1');}"
+                     "if(kind === 'analyze' && workerNoHtml && workerNoHtml.checked){"
+                     "params.set('no_html','1');}"
+                     "const baseUrl = `/run${tokenQuery}`;"
+                     "const joiner = baseUrl.includes('?') ? '&' : '?';"
+                     "const url = `${baseUrl}${joiner}${params.toString()}`;"
+                     "workerOutput.hidden=true;"
+                     "setWorkerStatus(`Running ${kind}...`, false);"
+                     "try{"
+                     "const res=await fetch(url,{cache:'no-store'});"
+                     "if(!res.ok){const text=await res.text();throw new Error(text || `HTTP ${res.status}`);}"
+                     "const data=await res.json();"
+                     "const summary=`${data.job} worker exit=${data.exit_code} status=${data.status}`;"
+                     "const output=data.output || '(no output)';"
+                     "workerOutput.textContent=`${summary}\\n\\n${output}`;"
+                     "workerOutput.hidden=false;"
+                     "setWorkerStatus(data.status === 'error' ? 'Worker error' : 'Worker complete',"
+                     "data.status === 'error');"
+                     "}catch(err){"
+                     "workerOutput.textContent=`Worker failed: ${err.message}`;"
+                     "workerOutput.hidden=false;"
+                     "setWorkerStatus('Worker failed', true);"
+                     "}"
+                     "}"
+                     "workerButtons.forEach((btn)=>{"
+                     "btn.addEventListener('click',()=>{"
+                     "runWorker(btn.dataset.worker);"
+                     "});"
+                     "});")) {
         return 0;
     }
     if (!json_append(output, output_len, &offset,
@@ -2021,6 +2211,201 @@ static int handle_panel(const char *query, int client_fd) {
     return send_response_with_type(client_fd, 200, "OK", "text/html; charset=utf-8", body);
 }
 
+static int run_worker_process(const char *worker_path,
+                              char *const *argv,
+                              char *output,
+                              size_t output_len,
+                              int *exit_code_out,
+                              int *signal_out,
+                              int *truncated_out) {
+    if (!worker_path || !argv || !output || output_len == 0) {
+        return 0;
+    }
+    if (exit_code_out) {
+        *exit_code_out = -1;
+    }
+    if (signal_out) {
+        *signal_out = 0;
+    }
+    if (truncated_out) {
+        *truncated_out = 0;
+    }
+
+    sigset_t block_mask;
+    sigset_t prev_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &block_mask, &prev_mask) != 0) {
+        return 0;
+    }
+
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) {
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        return 0;
+    }
+
+    if (pid == 0) {
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0 || dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        close(pipe_fds[1]);
+        execv(worker_path, argv);
+        dprintf(STDERR_FILENO, "exec failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+    size_t offset = 0;
+    int truncated = 0;
+    char discard[256];
+    while (1) {
+        if (offset + 1 >= output_len) {
+            truncated = 1;
+        }
+        char *target = truncated ? discard : output + offset;
+        size_t capacity = truncated ? sizeof(discard) : (output_len - offset - 1);
+        ssize_t bytes = read(pipe_fds[0], target, capacity);
+        if (bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (bytes == 0) {
+            break;
+        }
+        if (!truncated) {
+            offset += (size_t)bytes;
+        }
+    }
+    output[offset] = '\0';
+    close(pipe_fds[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        return 0;
+    }
+    if (WIFEXITED(status)) {
+        if (exit_code_out) {
+            *exit_code_out = WEXITSTATUS(status);
+        }
+    } else if (WIFSIGNALED(status)) {
+        if (signal_out) {
+            *signal_out = WTERMSIG(status);
+        }
+        if (exit_code_out) {
+            *exit_code_out = 128 + WTERMSIG(status);
+        }
+    }
+    if (truncated_out) {
+        *truncated_out = truncated;
+    }
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    return 1;
+}
+
+static int handle_run_worker(const char *root,
+                             const char *query,
+                             const char *exe_dir,
+                             int client_fd) {
+    char job_value[32];
+    if (!get_query_param(query, "job", job_value, sizeof(job_value))) {
+        return send_response(client_fd, 400, "Bad Request", "missing job\n");
+    }
+
+    worker_kind_t worker;
+    if (!parse_worker_kind(job_value, &worker)) {
+        return send_response(client_fd, 400, "Bad Request", "invalid job\n");
+    }
+
+    int prefer_priority = 0;
+    char prefer_value[16];
+    if (get_query_param(query, "prefer_priority", prefer_value, sizeof(prefer_value))) {
+        prefer_priority = parse_bool_param(prefer_value);
+    }
+
+    int no_html = 0;
+    char no_html_value[16];
+    if (get_query_param(query, "no_html", no_html_value, sizeof(no_html_value))) {
+        no_html = parse_bool_param(no_html_value);
+    }
+
+    const char *binary_name = worker_binary_name(worker);
+    char worker_path[PATH_MAX];
+    if (!build_worker_path(exe_dir, binary_name, worker_path, sizeof(worker_path))) {
+        return send_response(client_fd, 500, "Internal Server Error", "worker path too long\n");
+    }
+    if (access(worker_path, X_OK) != 0) {
+        return send_response(client_fd, 500, "Internal Server Error", "worker not executable\n");
+    }
+
+    const char *argv[6];
+    int argc = 0;
+    argv[argc++] = worker_path;
+    argv[argc++] = root;
+    if (prefer_priority) {
+        argv[argc++] = "--prefer-priority";
+    }
+    if (worker == WORKER_ANALYZE && no_html) {
+        argv[argc++] = "--no-html";
+    }
+    argv[argc] = NULL;
+
+    char output[HTTP_WORKER_OUTPUT_BUFFER];
+    int exit_code = -1;
+    int signal_id = 0;
+    int truncated = 0;
+    if (!run_worker_process(worker_path, (char *const *)argv, output, sizeof(output),
+                            &exit_code, &signal_id, &truncated)) {
+        return send_response(client_fd, 500, "Internal Server Error", "worker execution failed\n");
+    }
+
+    const char *status = "ok";
+    if (exit_code == 2) {
+        status = "empty";
+    } else if (exit_code != 0) {
+        status = "error";
+    }
+
+    char escaped_output[HTTP_WORKER_OUTPUT_BUFFER * 2];
+    if (!json_escape(output, escaped_output, sizeof(escaped_output))) {
+        return send_response(client_fd, 500, "Internal Server Error", "worker output too large\n");
+    }
+
+    char body[HTTP_BUFFER_SIZE * 4];
+    if (snprintf(body, sizeof(body),
+                 "{"
+                 "\"status\":\"%s\","
+                 "\"job\":\"%s\","
+                 "\"exit_code\":%d,"
+                 "\"signal\":%d,"
+                 "\"truncated\":%s,"
+                 "\"output\":\"%s\""
+                 "}",
+                 status,
+                 worker_kind_label(worker),
+                 exit_code,
+                 signal_id,
+                 truncated ? "true" : "false",
+                 escaped_output) < 0) {
+        return send_response(client_fd, 500, "Internal Server Error", "worker response failed\n");
+    }
+
+    return send_response_with_type(client_fd, 200, "OK", "application/json", body);
+}
+
 static int is_authorized(const char *token_config, const char *auth_header, const char *query) {
     if (!token_config || token_config[0] == '\0') {
         return 1;
@@ -2270,6 +2655,13 @@ static int route_request(const char *root,
         return handle_status(root, query, client_fd);
     }
 
+    if (strcmp(decoded_path, "/run") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
+        return handle_run_worker(root, query, server_exe_dir_set ? server_exe_dir : NULL, client_fd);
+    }
+
     if (strcmp(decoded_path, "/retrieve") == 0) {
         if (!is_get) {
             return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
@@ -2323,6 +2715,8 @@ int main(int argc, char **argv) {
     if (token_config && token_config[0] == '\0') {
         token_config = NULL;
     }
+
+    server_exe_dir_set = resolve_executable_dir(argv[0], server_exe_dir, sizeof(server_exe_dir));
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -2797,10 +3191,50 @@ static int test_build_panel_html(void) {
     if (!assert_true(strstr(html, "Submit OCR") != NULL, "panel upload form present")) {
         return 0;
     }
+    if (!assert_true(strstr(html, "Run worker jobs") != NULL, "panel worker section present")) {
+        return 0;
+    }
     if (!assert_true(build_panel_html("tok\"en", html, sizeof(html)), "build panel html with token")) {
         return 0;
     }
     if (!assert_true(strstr(html, "tok\\\"en") != NULL, "token escaped in html")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_worker_helpers(void) {
+    worker_kind_t kind = WORKER_OCR;
+    if (!assert_true(parse_worker_kind("ocr", &kind) && kind == WORKER_OCR, "parse ocr worker")) {
+        return 0;
+    }
+    if (!assert_true(parse_worker_kind("redact", &kind) && kind == WORKER_REDACT, "parse redact worker")) {
+        return 0;
+    }
+    if (!assert_true(parse_worker_kind("redaction", &kind) && kind == WORKER_REDACT,
+                     "parse redaction worker")) {
+        return 0;
+    }
+    if (!assert_true(parse_worker_kind("analysis", &kind) && kind == WORKER_ANALYZE, "parse analysis worker")) {
+        return 0;
+    }
+    if (!assert_true(!parse_worker_kind("unknown", &kind), "reject unknown worker")) {
+        return 0;
+    }
+
+    char worker_path[PATH_MAX];
+    if (!assert_true(build_worker_path("/opt/bin", "job_queue_ocr", worker_path, sizeof(worker_path)),
+                     "build worker path")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(worker_path, "/opt/bin/job_queue_ocr") == 0, "worker path content")) {
+        return 0;
+    }
+    if (!assert_true(build_worker_path("", "job_queue_ocr", worker_path, sizeof(worker_path)),
+                     "build worker path without dir")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(worker_path, "job_queue_ocr") == 0, "worker path without dir content")) {
         return 0;
     }
     return 1;
@@ -2867,6 +3301,7 @@ int main(void) {
     passed &= test_build_log_path();
     passed &= test_json_escape();
     passed &= test_build_panel_html();
+    passed &= test_worker_helpers();
     passed &= test_multipart_parsing();
 
     if (!passed) {

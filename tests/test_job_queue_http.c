@@ -1341,6 +1341,10 @@ static int test_http_panel_page(void) {
         stop_server(pid);
         return 0;
     }
+    if (!assert_true(strstr(output, "Run worker jobs") != NULL, "panel worker section")) {
+        stop_server(pid);
+        return 0;
+    }
 
     snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/", port);
     if (!assert_true(read_command_output(command, output, sizeof(output)), "root panel request")) {
@@ -1352,6 +1356,83 @@ static int test_http_panel_page(void) {
         return 0;
     }
     if (!assert_true(strstr(output, "Submit OCR") != NULL, "root panel upload form")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "Run worker jobs") != NULL, "root panel worker section")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
+static int test_http_run_worker(void) {
+    char template[] = "/tmp/pap_test_http_run_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for run worker")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    const char *contents = "%PDF-1.6\n1 0 obj\n<<>>\nendobj\n";
+    if (!assert_true(write_file(pdf_src, contents), "write run worker pdf")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "{}"), "write run worker metadata")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_submit(root, "run-ocr", pdf_src, metadata_src, 0) == JQ_OK,
+                     "submit run worker job")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9116;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for run worker")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char output[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/run?job=ocr", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "run worker request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "\"status\":\"ok\"") != NULL, "run worker status ok")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "\"job\":\"ocr\"") != NULL, "run worker job field")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    char pdf_complete[PATH_MAX];
+    char metadata_complete[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "run-ocr", JQ_STATE_COMPLETE,
+                                  pdf_complete, sizeof(pdf_complete),
+                                  metadata_complete, sizeof(metadata_complete)) == JQ_OK,
+                     "run worker complete paths")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(pdf_complete), "run worker pdf complete")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(file_exists(metadata_complete), "run worker metadata complete")) {
         stop_server(pid);
         return 0;
     }
@@ -1430,6 +1511,7 @@ int main(void) {
     passed &= test_http_url_decoding();
     passed &= test_http_invalid_uuid_and_path();
     passed &= test_http_metrics();
+    passed &= test_http_run_worker();
     passed &= test_http_panel_page();
     passed &= test_http_panel_auth();
 
