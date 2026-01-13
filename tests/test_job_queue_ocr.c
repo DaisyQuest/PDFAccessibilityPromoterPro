@@ -112,6 +112,12 @@ static int test_ocr_success(void) {
 
     return assert_true(strstr(metadata_buffer, "\"ocr_status\":\"complete\"") != NULL, "metadata status") &&
            assert_true(strstr(metadata_buffer, "\"ocr_provider\":\"builtin\"") != NULL, "metadata provider") &&
+           assert_true(strstr(metadata_buffer, "\"handwriting_detected\":false") != NULL,
+                       "metadata handwriting detected false") &&
+           assert_true(strstr(metadata_buffer, "\"handwriting_confidence\":0") != NULL,
+                       "metadata handwriting confidence zero") &&
+           assert_true(strstr(metadata_buffer, "\"handwriting_markers\":0") != NULL,
+                       "metadata handwriting markers zero") &&
            assert_true(strstr(metadata_buffer, "\"pdf_version\":\"1.6\"") != NULL, "metadata version");
 }
 

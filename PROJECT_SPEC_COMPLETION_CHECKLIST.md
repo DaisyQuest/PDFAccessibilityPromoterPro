@@ -31,6 +31,7 @@
 - [x] Analysis-only job reporting implemented.
 - [x] OCR job reporting implemented.
 - [x] OCR provider registry and logging implemented.
+- [x] OCR handwriting heuristic detection refined.
 - [x] Redaction engine and job workflow implemented.
 
 ## API

@@ -26,13 +26,14 @@
 #define HTTP_UUID_SIZE 128
 #define HTTP_METHOD_SIZE 16
 #define HTTP_MAX_REQUEST_BYTES 8192
+#define HTTP_MAX_BODY_BYTES (10 * 1024 * 1024)
 #define HTTP_MAX_HEADER_LINES 50
 #define HTTP_REQUEST_LINE_TIMEOUT_MS 2000
 #define HTTP_HEADERS_TIMEOUT_MS 5000
 #define HTTP_SOCKET_TIMEOUT_MS 1000
 #define HTTP_MAX_CHILDREN 32
 #define HTTP_METRICS_BUFFER 16384
-#define HTTP_PANEL_BUFFER 32768
+#define HTTP_PANEL_BUFFER 65536
 
 typedef enum {
     READ_OK = 0,
@@ -43,6 +44,7 @@ typedef enum {
 } read_result_t;
 
 static int url_decode(const char *src, char *dst, size_t dst_len);
+static void trim_token(char *value);
 
 static volatile sig_atomic_t active_children = 0;
 static struct timespec server_start_time;
@@ -86,19 +88,21 @@ static int send_response_with_type(int client_fd,
                                    const char *status_text,
                                    const char *content_type,
                                    const char *body) {
-    char response[HTTP_BUFFER_SIZE];
-    int body_len = body ? (int)strlen(body) : 0;
-    int written = snprintf(response, sizeof(response),
+    char header[HTTP_BUFFER_SIZE];
+    size_t body_len = body ? strlen(body) : 0;
+    int written = snprintf(header, sizeof(header),
                            "HTTP/1.1 %d %s\r\n"
                            "Content-Type: %s\r\n"
-                           "Content-Length: %d\r\n"
-                           "Connection: close\r\n\r\n"
-                           "%s",
-                           status, status_text, content_type, body_len, body ? body : "");
-    if (written < 0 || (size_t)written >= sizeof(response)) {
+                           "Content-Length: %zu\r\n"
+                           "Connection: close\r\n\r\n",
+                           status, status_text, content_type, body_len);
+    if (written < 0 || (size_t)written >= sizeof(header)) {
         return status;
     }
-    write_all(client_fd, response, (size_t)written);
+    write_all(client_fd, header, (size_t)written);
+    if (body_len > 0) {
+        write_all(client_fd, body, body_len);
+    }
     return status;
 }
 
@@ -177,6 +181,79 @@ static read_result_t read_request(int client_fd, char *buffer, size_t cap, size_
     }
 
     return READ_TOO_LARGE;
+}
+
+static int parse_content_length(const char *value, size_t *length_out) {
+    if (!value || !length_out || value[0] == '\0') {
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long length = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return 0;
+    }
+    *length_out = (size_t)length;
+    return 1;
+}
+
+static int read_request_body(int client_fd,
+                             const char *header_buffer,
+                             size_t header_len,
+                             size_t content_length,
+                             char **body_out) {
+    if (!header_buffer || !body_out) {
+        return 0;
+    }
+    if (content_length == 0) {
+        *body_out = NULL;
+        return 1;
+    }
+    if (content_length > HTTP_MAX_BODY_BYTES) {
+        return 0;
+    }
+
+    char *body = malloc(content_length + 1);
+    if (!body) {
+        return 0;
+    }
+
+    size_t header_end = 0;
+    const char *header_marker = strstr(header_buffer, "\r\n\r\n");
+    if (header_marker) {
+        header_end = (size_t)(header_marker - header_buffer) + 4;
+    }
+
+    size_t available = header_len > header_end ? header_len - header_end : 0;
+    size_t to_copy = available > content_length ? content_length : available;
+    if (to_copy > 0) {
+        memcpy(body, header_buffer + header_end, to_copy);
+    }
+
+    size_t total = to_copy;
+    while (total < content_length) {
+        ssize_t bytes = recv(client_fd, body + total, content_length - total, 0);
+        if (bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(body);
+            return 0;
+        }
+        if (bytes == 0) {
+            break;
+        }
+        total += (size_t)bytes;
+    }
+
+    if (total < content_length) {
+        free(body);
+        return 0;
+    }
+
+    body[content_length] = '\0';
+    *body_out = body;
+    return 1;
 }
 
 typedef enum {
@@ -328,6 +405,180 @@ static int json_escape(const char *input, char *output, size_t output_len) {
     return 1;
 }
 
+static const char *find_bytes(const char *haystack,
+                              size_t haystack_len,
+                              const char *needle,
+                              size_t needle_len) {
+    if (!haystack || !needle || needle_len == 0 || haystack_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i + needle_len <= haystack_len; ++i) {
+        if (memcmp(haystack + i, needle, needle_len) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
+static int parse_multipart_boundary(const char *content_type, char *boundary, size_t boundary_len) {
+    if (!content_type || !boundary || boundary_len == 0) {
+        return 0;
+    }
+    const char *marker = "boundary=";
+    const char *start = strstr(content_type, marker);
+    if (!start) {
+        return 0;
+    }
+    start += strlen(marker);
+    if (*start == '\0') {
+        return 0;
+    }
+    const char *end = start;
+    while (*end != '\0' && *end != ';' && *end != ' ' && *end != '\r' && *end != '\n') {
+        end++;
+    }
+    size_t len = (size_t)(end - start);
+    if (len == 0 || len + 1 > boundary_len) {
+        return 0;
+    }
+    memcpy(boundary, start, len);
+    boundary[len] = '\0';
+    return 1;
+}
+
+static int parse_multipart_part(const char *body,
+                                size_t body_len,
+                                const char *boundary,
+                                const char *field_name,
+                                const char **data_out,
+                                size_t *data_len_out,
+                                char *filename_out,
+                                size_t filename_len) {
+    if (!body || !boundary || !field_name || !data_out || !data_len_out) {
+        return 0;
+    }
+    *data_out = NULL;
+    *data_len_out = 0;
+    if (filename_out && filename_len > 0) {
+        filename_out[0] = '\0';
+    }
+
+    char boundary_marker[128];
+    int marker_written = snprintf(boundary_marker, sizeof(boundary_marker), "--%s", boundary);
+    if (marker_written < 0 || (size_t)marker_written >= sizeof(boundary_marker)) {
+        return 0;
+    }
+    size_t marker_len = (size_t)marker_written;
+
+    const char *cursor = body;
+    size_t remaining = body_len;
+    while (remaining >= marker_len) {
+        const char *part_start = find_bytes(cursor, remaining, boundary_marker, marker_len);
+        if (!part_start) {
+            return 0;
+        }
+        part_start += marker_len;
+        remaining = body_len - (size_t)(part_start - body);
+
+        if (remaining >= 2 && part_start[0] == '-' && part_start[1] == '-') {
+            return 0;
+        }
+        if (remaining >= 2 && part_start[0] == '\r' && part_start[1] == '\n') {
+            part_start += 2;
+            remaining -= 2;
+        }
+
+        const char *headers_end = find_bytes(part_start, remaining, "\r\n\r\n", 4);
+        if (!headers_end) {
+            return 0;
+        }
+        size_t header_len = (size_t)(headers_end - part_start);
+        char header_buffer[1024];
+        size_t copy_len = header_len < sizeof(header_buffer) - 1 ? header_len : sizeof(header_buffer) - 1;
+        memcpy(header_buffer, part_start, copy_len);
+        header_buffer[copy_len] = '\0';
+
+        char name_buffer[64];
+        name_buffer[0] = '\0';
+        char filename_buffer[256];
+        filename_buffer[0] = '\0';
+
+        const char *name_pos = strstr(header_buffer, "name=\"");
+        if (name_pos) {
+            name_pos += strlen("name=\"");
+            const char *name_end = strchr(name_pos, '"');
+            if (name_end) {
+                size_t name_len = (size_t)(name_end - name_pos);
+                if (name_len < sizeof(name_buffer)) {
+                    memcpy(name_buffer, name_pos, name_len);
+                    name_buffer[name_len] = '\0';
+                }
+            }
+        }
+
+        const char *file_pos = strstr(header_buffer, "filename=\"");
+        if (file_pos) {
+            file_pos += strlen("filename=\"");
+            const char *file_end = strchr(file_pos, '"');
+            if (file_end) {
+                size_t file_len = (size_t)(file_end - file_pos);
+                if (file_len < sizeof(filename_buffer)) {
+                    memcpy(filename_buffer, file_pos, file_len);
+                    filename_buffer[file_len] = '\0';
+                }
+            }
+        }
+
+        const char *data_start = headers_end + 4;
+        size_t data_remaining = body_len - (size_t)(data_start - body);
+        const char *next_boundary = find_bytes(data_start, data_remaining, boundary_marker, marker_len);
+        if (!next_boundary) {
+            return 0;
+        }
+        size_t data_len = (size_t)(next_boundary - data_start);
+        if (data_len >= 2 && data_start[data_len - 2] == '\r' && data_start[data_len - 1] == '\n') {
+            data_len -= 2;
+        }
+
+        if (name_buffer[0] != '\0' && strcmp(name_buffer, field_name) == 0) {
+            *data_out = data_start;
+            *data_len_out = data_len;
+            if (filename_out && filename_len > 0) {
+                snprintf(filename_out, filename_len, "%s", filename_buffer);
+            }
+            return 1;
+        }
+
+        cursor = next_boundary;
+        remaining = body_len - (size_t)(cursor - body);
+    }
+    return 0;
+}
+
+static int read_multipart_text(const char *body,
+                               size_t body_len,
+                               const char *boundary,
+                               const char *field_name,
+                               char *output,
+                               size_t output_len) {
+    if (!output || output_len == 0) {
+        return 0;
+    }
+    output[0] = '\0';
+    const char *data = NULL;
+    size_t data_len = 0;
+    if (!parse_multipart_part(body, body_len, boundary, field_name, &data, &data_len, NULL, 0)) {
+        return 0;
+    }
+    if (data_len + 1 > output_len) {
+        return 0;
+    }
+    memcpy(output, data, data_len);
+    output[data_len] = '\0';
+    trim_token(output);
+    return 1;
+}
+
 static int json_append(char *buffer, size_t buffer_len, size_t *offset, const char *fmt, ...) {
     if (!buffer || !offset || *offset >= buffer_len) {
         return 0;
@@ -384,6 +635,16 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
         "a{color:#2563eb;text-decoration:none;font-weight:600;}"
         ".pill{background:#e2e8f0;color:#1e293b;padding:4px 10px;border-radius:999px;font-size:12px;}"
         ".error{color:#dc2626;font-weight:600;}"
+        ".upload-panel{margin-top:24px;background:#f8fafc;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(15,23,42,.25);}"
+        ".upload-panel h2{margin:0 0 8px;font-size:20px;color:#0f172a;}"
+        ".upload-panel p{margin:0 0 16px;color:#64748b;}"
+        ".form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;}"
+        ".form-field{display:flex;flex-direction:column;gap:6px;font-size:14px;color:#1e293b;}"
+        ".form-field input[type=\"text\"],.form-field textarea{border:1px solid #cbd5f5;border-radius:10px;padding:10px;font-size:14px;}"
+        ".form-field textarea{min-height:96px;resize:vertical;}"
+        ".form-footer{margin-top:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;}"
+        ".result{margin-top:16px;padding:12px;border-radius:12px;background:#eef2ff;color:#1e293b;font-size:13px;}"
+        ".result code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;}"
         "</style></head><body><div class=\"wrap\">"
         "<section class=\"hero\"><div>"
         "<h1>Job Queue Monitor</h1>"
@@ -432,7 +693,39 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
         "<div class=\"row\"><span>Reports</span><span id=\"errorReport\">0</span></div>"
         "<div class=\"row\"><span>Locked</span><span id=\"errorLocked\">0</span></div>"
         "<div class=\"row\"><span>Orphans</span><span id=\"errorOrphans\">0</span></div>"
-        "</div></div></section></div><script>"
+        "</div></div></section>"
+        "<section class=\"upload-panel\">"
+        "<h2>Submit OCR &amp; Redaction</h2>"
+        "<p>Upload a PDF for OCR and optionally request redaction. Jobs are queued immediately and written under the job root.</p>"
+        "<form id=\"uploadForm\">"
+        "<div class=\"form-grid\">"
+        "<label class=\"form-field\">PDF file"
+        "<input id=\"pdfInput\" name=\"pdf\" type=\"file\" accept=\"application/pdf\" required>"
+        "</label>"
+        "<label class=\"form-field\">Output folder"
+        "<input id=\"outputDir\" name=\"output_dir\" type=\"text\" value=\"uploads\">"
+        "</label>"
+        "<label class=\"form-field\">Job label"
+        "<input id=\"labelInput\" name=\"label\" type=\"text\" value=\"ocr\">"
+        "</label>"
+        "<label class=\"form-field\">Priority"
+        "<input id=\"priorityInput\" name=\"priority\" type=\"checkbox\" value=\"1\">"
+        "</label>"
+        "<label class=\"form-field\">Enable redaction"
+        "<input id=\"redactToggle\" name=\"redact\" type=\"checkbox\" value=\"1\">"
+        "</label>"
+        "<label class=\"form-field\">Redaction terms (comma or newline separated)"
+        "<textarea id=\"redactionsInput\" name=\"redactions\" placeholder=\"SECRET&#10;CONFIDENTIAL\"></textarea>"
+        "</label>"
+        "</div>"
+        "<div class=\"form-footer\">"
+        "<button id=\"submitBtn\" type=\"submit\">Submit job</button>"
+        "<span id=\"submitStatus\" class=\"pill\">Waiting for input</span>"
+        "</div>"
+        "</form>"
+        "<div id=\"resultBox\" class=\"result\" hidden></div>"
+        "</section>"
+        "</div><script>"
     };
     for (size_t i = 0; i < sizeof(chunks) / sizeof(chunks[0]); ++i) {
         if (!json_append(output, output_len, &offset, "%s", chunks[i])) {
@@ -443,10 +736,17 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
                      "const token = \"%s\";"
                      "const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : \"\";"
                      "const metricsUrl = `/metrics${tokenQuery}`;"
+                     "const uploadUrl = `/upload${tokenQuery}`;"
                      "const refreshBtn = document.getElementById('refreshBtn');"
                      "const metricsLink = document.getElementById('metricsLink');"
                      "metricsLink.href = metricsUrl;"
-                     "const errorText = document.getElementById('errorText');",
+                     "const errorText = document.getElementById('errorText');"
+                     "const uploadForm = document.getElementById('uploadForm');"
+                     "const submitBtn = document.getElementById('submitBtn');"
+                     "const submitStatus = document.getElementById('submitStatus');"
+                     "const resultBox = document.getElementById('resultBox');"
+                     "const redactionToggle = document.getElementById('redactToggle');"
+                     "const redactionsInput = document.getElementById('redactionsInput');",
                      escaped_token)) {
         return 0;
     }
@@ -479,6 +779,69 @@ static int build_panel_html(const char *token, char *output, size_t output_len) 
                      "setState('priority', data.states.priority);"
                      "setState('complete', data.states.complete);"
                      "setState('error', data.states.error);"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "function setSubmitStatus(text, isError){"
+                     "submitStatus.textContent=text;"
+                     "submitStatus.style.background=isError ? '#fee2e2' : '#e2e8f0';"
+                     "submitStatus.style.color=isError ? '#991b1b' : '#1e293b';"
+                     "}"
+                     "function showResult(html){"
+                     "resultBox.innerHTML=html;"
+                     "resultBox.hidden=false;"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "if(redactionToggle){"
+                     "redactionsInput.disabled=!redactionToggle.checked;"
+                     "redactionToggle.addEventListener('change',()=>{"
+                     "redactionsInput.disabled=!redactionToggle.checked;});"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "if(uploadForm){"
+                     "uploadForm.addEventListener('submit',async (event)=>{"
+                     "event.preventDefault();"
+                     "if(!uploadForm.reportValidity()){return;}"
+                     "const fileInput=document.getElementById('pdfInput');"
+                     "if(!fileInput.files.length){"
+                     "setSubmitStatus('Please choose a PDF.', true);return;}"
+                     "submitBtn.disabled=true;"
+                     "setSubmitStatus('Uploading...', false);"
+                     "resultBox.hidden=true;"
+                     "const formData=new FormData(uploadForm);"
+                     "if(!redactionToggle.checked){"
+                     "formData.delete('redact');"
+                     "formData.delete('redactions');"
+                     "}"
+                     "if(!document.getElementById('priorityInput').checked){"
+                     "formData.delete('priority');"
+                     "}"
+                     "try{"
+                     "const res=await fetch(uploadUrl,{method:'POST',body:formData});"
+                     "if(!res.ok){const text=await res.text();"
+                     "throw new Error(text || `HTTP ${res.status}`);}"
+                     "const data=await res.json();"
+                     "let html=`<strong>Queued OCR job:</strong> <code>${data.ocr_uuid}</code><br>`;"
+                     "html+=`<strong>Upload folder:</strong> <code>${data.upload_dir}</code><br>`;"
+                     "html+=`<strong>Expected OCR output:</strong> <code>${data.expected.ocr.pdf}</code><br>`;"
+                     "if(data.expected.redact){"
+                     "html+=`<strong>Queued redaction job:</strong> <code>${data.expected.redact.uuid}</code><br>`;"
+                     "html+=`<strong>Expected redaction output:</strong> <code>${data.expected.redact.pdf}</code><br>`;"
+                     "}"
+                     "showResult(html);"
+                     "setSubmitStatus('Submitted successfully', false);"
+                     "uploadForm.reset();"
+                     "redactionsInput.disabled=true;"
+                     "}catch(err){"
+                     "setSubmitStatus('Upload failed', true);"
+                     "showResult(`<strong>Error:</strong> ${err.message}`);"
+                     "}finally{submitBtn.disabled=false;}"
+                     "});"
                      "}")) {
         return 0;
     }
@@ -791,6 +1154,180 @@ static int is_safe_relpath(const char *value) {
     return 1;
 }
 
+static int ensure_directory_recursive(const char *path) {
+    if (!path || path[0] == '\0') {
+        return 0;
+    }
+    char buffer[PATH_MAX];
+    if (strlen(path) >= sizeof(buffer)) {
+        return 0;
+    }
+    snprintf(buffer, sizeof(buffer), "%s", path);
+    for (char *cursor = buffer + 1; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') {
+            *cursor = '\0';
+            if (mkdir(buffer, 0755) != 0 && errno != EEXIST) {
+                return 0;
+            }
+            *cursor = '/';
+        }
+    }
+    if (mkdir(buffer, 0755) != 0 && errno != EEXIST) {
+        return 0;
+    }
+    return 1;
+}
+
+static int write_file_binary(const char *path, const char *data, size_t length) {
+    if (!path || (!data && length > 0)) {
+        return 0;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return 0;
+    }
+    if (length > 0 && fwrite(data, 1, length, fp) != length) {
+        fclose(fp);
+        return 0;
+    }
+    if (fclose(fp) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void trim_token(char *value) {
+    if (!value) {
+        return;
+    }
+    size_t len = strlen(value);
+    size_t start = 0;
+    while (start < len && isspace((unsigned char)value[start])) {
+        start++;
+    }
+    size_t end = len;
+    while (end > start && isspace((unsigned char)value[end - 1])) {
+        end--;
+    }
+    if (start > 0) {
+        memmove(value, value + start, end - start);
+    }
+    value[end - start] = '\0';
+}
+
+static int generate_uuid(const char *label, char *output, size_t output_len) {
+    static unsigned int counter = 0;
+    if (!output || output_len == 0) {
+        return 0;
+    }
+    const char *prefix = (label && is_valid_uuid(label) == 200) ? label : "upload";
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        now.tv_sec = time(NULL);
+        now.tv_nsec = 0;
+    }
+    counter++;
+    int written = snprintf(output, output_len, "%s-%lld-%d-%u",
+                           prefix, (long long)now.tv_sec, (int)getpid(), counter);
+    if (written < 0 || (size_t)written >= output_len) {
+        return 0;
+    }
+    return is_valid_uuid(output) == 200;
+}
+
+static char *build_metadata_json(const char *output_dir,
+                                 const char *redactions,
+                                 int include_redactions,
+                                 size_t *length_out) {
+    if (length_out) {
+        *length_out = 0;
+    }
+    const char *safe_output = output_dir ? output_dir : "";
+    char escaped_output[PATH_MAX * 2];
+    if (!json_escape(safe_output, escaped_output, sizeof(escaped_output))) {
+        return NULL;
+    }
+
+    size_t buffer_len = 512 + (redactions ? strlen(redactions) * 3 : 0);
+    char *buffer = malloc(buffer_len);
+    if (!buffer) {
+        return NULL;
+    }
+    size_t offset = 0;
+    if (!json_append(buffer, buffer_len, &offset, "{")) {
+        free(buffer);
+        return NULL;
+    }
+
+    if (!json_append(buffer, buffer_len, &offset, "\"output_dir\":\"%s\"", escaped_output)) {
+        free(buffer);
+        return NULL;
+    }
+
+    if (include_redactions) {
+        if (!json_append(buffer, buffer_len, &offset, ",\"redactions\":[")) {
+            free(buffer);
+            return NULL;
+        }
+        int first = 1;
+        if (redactions) {
+            char *copy = strdup(redactions);
+            if (!copy) {
+                free(buffer);
+                return NULL;
+            }
+            char *cursor = copy;
+            while (cursor && *cursor != '\0') {
+                char *next = strpbrk(cursor, ",\n\r");
+                if (next) {
+                    *next = '\0';
+                }
+                trim_token(cursor);
+                if (cursor[0] != '\0') {
+                    char escaped_token[256];
+                    if (!json_escape(cursor, escaped_token, sizeof(escaped_token))) {
+                        free(copy);
+                        free(buffer);
+                        return NULL;
+                    }
+                    if (!first) {
+                        if (!json_append(buffer, buffer_len, &offset, ",")) {
+                            free(copy);
+                            free(buffer);
+                            return NULL;
+                        }
+                    }
+                    if (!json_append(buffer, buffer_len, &offset, "\"%s\"", escaped_token)) {
+                        free(copy);
+                        free(buffer);
+                        return NULL;
+                    }
+                    first = 0;
+                }
+                if (!next) {
+                    break;
+                }
+                cursor = next + 1;
+            }
+            free(copy);
+        }
+        if (!json_append(buffer, buffer_len, &offset, "]")) {
+            free(buffer);
+            return NULL;
+        }
+    }
+
+    if (!json_append(buffer, buffer_len, &offset, "}")) {
+        free(buffer);
+        return NULL;
+    }
+
+    if (length_out) {
+        *length_out = offset;
+    }
+    return buffer;
+}
+
 static int is_path_under_root(const char *root_real, const char *path_real) {
     size_t root_len = strlen(root_real);
     if (strncmp(root_real, path_real, root_len) != 0) {
@@ -1099,6 +1636,165 @@ static int handle_submit(const char *root, const char *query, int client_fd) {
     return send_response(client_fd, 500, "Internal Server Error", "io error\n");
 }
 
+static int handle_upload(const char *root,
+                         const char *query,
+                         const char *content_type,
+                         const char *body,
+                         size_t body_len,
+                         int client_fd) {
+    (void)query;
+    if (!root || !content_type || !body) {
+        return send_response(client_fd, 400, "Bad Request", "missing upload data\n");
+    }
+
+    char boundary[128];
+    if (!parse_multipart_boundary(content_type, boundary, sizeof(boundary))) {
+        return send_response(client_fd, 400, "Bad Request", "missing boundary\n");
+    }
+
+    const char *pdf_data = NULL;
+    size_t pdf_len = 0;
+    char filename[256];
+    if (!parse_multipart_part(body, body_len, boundary, "pdf", &pdf_data, &pdf_len,
+                              filename, sizeof(filename))) {
+        return send_response(client_fd, 400, "Bad Request", "missing pdf file\n");
+    }
+    if (pdf_len == 0) {
+        return send_response(client_fd, 400, "Bad Request", "empty pdf file\n");
+    }
+
+    char output_dir[128] = "uploads";
+    char redactions[2048] = "";
+    char redact_flag[16] = "";
+    char priority_flag[16] = "";
+    char label[64] = "";
+
+    (void)read_multipart_text(body, body_len, boundary, "output_dir", output_dir, sizeof(output_dir));
+    (void)read_multipart_text(body, body_len, boundary, "redactions", redactions, sizeof(redactions));
+    (void)read_multipart_text(body, body_len, boundary, "redact", redact_flag, sizeof(redact_flag));
+    (void)read_multipart_text(body, body_len, boundary, "priority", priority_flag, sizeof(priority_flag));
+    (void)read_multipart_text(body, body_len, boundary, "label", label, sizeof(label));
+
+    if (!is_safe_relpath(output_dir)) {
+        return send_response(client_fd, 400, "Bad Request", "invalid output directory\n");
+    }
+
+    int redact_enabled = redact_flag[0] != '\0' && strcmp(redact_flag, "0") != 0 &&
+                         strcasecmp(redact_flag, "false") != 0;
+    if (redact_enabled && redactions[0] == '\0') {
+        return send_response(client_fd, 400, "Bad Request", "redactions required\n");
+    }
+
+    char output_full[PATH_MAX];
+    if (!build_rooted_path(root, output_dir, output_full, sizeof(output_full))) {
+        return send_response(client_fd, 400, "Bad Request", "output path too long\n");
+    }
+    if (!ensure_directory_recursive(output_full)) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to create output directory\n");
+    }
+
+    char ocr_uuid[HTTP_UUID_SIZE];
+    if (!generate_uuid(label[0] != '\0' ? label : "ocr", ocr_uuid, sizeof(ocr_uuid))) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to generate uuid\n");
+    }
+
+    char pdf_path[PATH_MAX];
+    char ocr_metadata_path[PATH_MAX];
+    if (snprintf(pdf_path, sizeof(pdf_path), "%s/%s.pdf", output_full, ocr_uuid) < 0 ||
+        snprintf(ocr_metadata_path, sizeof(ocr_metadata_path), "%s/%s.metadata.json",
+                 output_full, ocr_uuid) < 0) {
+        return send_response(client_fd, 500, "Internal Server Error", "path too long\n");
+    }
+
+    if (!write_file_binary(pdf_path, pdf_data, pdf_len)) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to write pdf\n");
+    }
+
+    size_t ocr_meta_len = 0;
+    char *ocr_meta_json = build_metadata_json(output_dir, NULL, 0, &ocr_meta_len);
+    if (!ocr_meta_json) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to build metadata\n");
+    }
+    int ocr_meta_written = write_file_binary(ocr_metadata_path, ocr_meta_json, ocr_meta_len);
+    free(ocr_meta_json);
+    if (!ocr_meta_written) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to write metadata\n");
+    }
+
+    int priority = priority_flag[0] != '\0' && strcmp(priority_flag, "0") != 0 &&
+                   strcasecmp(priority_flag, "false") != 0;
+    jq_result_t submit_result = jq_submit(root, ocr_uuid, pdf_path, ocr_metadata_path, priority);
+    if (submit_result != JQ_OK) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to submit ocr job\n");
+    }
+
+    char redact_uuid[HTTP_UUID_SIZE] = "";
+    if (redact_enabled) {
+        if (!generate_uuid(label[0] != '\0' ? label : "redact", redact_uuid, sizeof(redact_uuid))) {
+            return send_response(client_fd, 500, "Internal Server Error", "failed to generate redact uuid\n");
+        }
+        char redact_metadata_path[PATH_MAX];
+        if (snprintf(redact_metadata_path, sizeof(redact_metadata_path), "%s/%s.metadata.json",
+                     output_full, redact_uuid) < 0) {
+            return send_response(client_fd, 500, "Internal Server Error", "path too long\n");
+        }
+        size_t redact_meta_len = 0;
+        char *redact_meta_json = build_metadata_json(output_dir, redactions, 1, &redact_meta_len);
+        if (!redact_meta_json) {
+            return send_response(client_fd, 500, "Internal Server Error", "failed to build redact metadata\n");
+        }
+        int redact_written = write_file_binary(redact_metadata_path, redact_meta_json, redact_meta_len);
+        free(redact_meta_json);
+        if (!redact_written) {
+            return send_response(client_fd, 500, "Internal Server Error", "failed to write redact metadata\n");
+        }
+        jq_result_t redact_submit = jq_submit(root, redact_uuid, pdf_path, redact_metadata_path, priority);
+        if (redact_submit != JQ_OK) {
+            return send_response(client_fd, 500, "Internal Server Error", "failed to submit redact job\n");
+        }
+    }
+
+    char escaped_output[PATH_MAX * 2];
+    char escaped_filename[256 * 2];
+    if (!json_escape(output_dir, escaped_output, sizeof(escaped_output)) ||
+        !json_escape(filename, escaped_filename, sizeof(escaped_filename))) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to encode response\n");
+    }
+
+    char body_buffer[HTTP_BUFFER_SIZE * 4];
+    size_t offset = 0;
+    if (!json_append(body_buffer, sizeof(body_buffer), &offset,
+                     "{"
+                     "\"status\":\"ok\","
+                     "\"ocr_uuid\":\"%s\","
+                     "\"upload_dir\":\"%s\","
+                     "\"filename\":\"%s\","
+                     "\"expected\":{"
+                     "\"ocr\":{"
+                     "\"metadata\":\"complete/%s.metadata.job\","
+                     "\"pdf\":\"complete/%s.pdf.job\""
+                     "}",
+                     ocr_uuid, escaped_output, escaped_filename, ocr_uuid, ocr_uuid)) {
+        return send_response(client_fd, 500, "Internal Server Error", "response too large\n");
+    }
+    if (redact_enabled) {
+        if (!json_append(body_buffer, sizeof(body_buffer), &offset,
+                         ",\"redact\":{"
+                         "\"uuid\":\"%s\","
+                         "\"metadata\":\"complete/%s.metadata.job\","
+                         "\"pdf\":\"complete/%s.pdf.job\""
+                         "}",
+                         redact_uuid, redact_uuid, redact_uuid)) {
+            return send_response(client_fd, 500, "Internal Server Error", "response too large\n");
+        }
+    }
+    if (!json_append(body_buffer, sizeof(body_buffer), &offset, "}}")) {
+        return send_response(client_fd, 500, "Internal Server Error", "response too large\n");
+    }
+
+    return send_response_with_type(client_fd, 200, "OK", "application/json", body_buffer);
+}
+
 static int handle_move(const char *root, const char *query, int client_fd) {
     char uuid[HTTP_UUID_SIZE];
     char from_value[32];
@@ -1262,6 +1958,7 @@ static int handle_metrics(const char *root, int client_fd) {
                      "\"root\":\"%s\","
                      "\"limits\":{"
                      "\"max_children\":%d,"
+                     "\"max_body_bytes\":%d,"
                      "\"max_request_bytes\":%d,"
                      "\"max_header_lines\":%d,"
                      "\"request_line_timeout_ms\":%d,"
@@ -1281,6 +1978,7 @@ static int handle_metrics(const char *root, int client_fd) {
                      uptime_seconds(),
                      escaped_root,
                      HTTP_MAX_CHILDREN,
+                     HTTP_MAX_BODY_BYTES,
                      HTTP_MAX_REQUEST_BYTES,
                      HTTP_MAX_HEADER_LINES,
                      HTTP_REQUEST_LINE_TIMEOUT_MS,
@@ -1350,6 +2048,9 @@ static int route_request(const char *root,
                          const char *path,
                          const char *auth_header,
                          const char *token_config,
+                         const char *content_type,
+                         const char *body,
+                         size_t body_len,
                          int client_fd);
 
 static void handle_client_connection(int client_fd,
@@ -1422,8 +2123,41 @@ static void handle_client_connection(int client_fd,
         auth_value = auth_header;
     }
 
-    status = route_request(root_real, method, path, auth_value, token_config, client_fd);
+    char content_type[128];
+    const char *content_type_value = NULL;
+    if (get_header_value(buffer, "Content-Type", content_type, sizeof(content_type))) {
+        content_type_value = content_type;
+    }
 
+    char content_length_value[32];
+    size_t content_length = 0;
+    char *body = NULL;
+    int needs_body = strncmp(path, "/upload", 7) == 0;
+    if (strcasecmp(method, "POST") == 0 && needs_body) {
+        if (!get_header_value(buffer, "Content-Length", content_length_value, sizeof(content_length_value)) ||
+            !parse_content_length(content_length_value, &content_length)) {
+            status = send_response(client_fd, 411, "Length Required", "missing content length\n");
+            goto log_request;
+        }
+        if (!read_request_body(client_fd, buffer, bytes, content_length, &body)) {
+            status = send_response(client_fd, 413, "Payload Too Large", "body too large\n");
+            goto log_request;
+        }
+    }
+
+    status = route_request(root_real,
+                           method,
+                           path,
+                           auth_value,
+                           token_config,
+                           content_type_value,
+                           body,
+                           content_length,
+                           client_fd);
+    free(body);
+
+log_request:
+    ;
     struct timespec end_time;
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     long long latency = elapsed_ms(&start_time, &end_time);
@@ -1443,9 +2177,14 @@ static int route_request(const char *root,
                          const char *path,
                          const char *auth_header,
                          const char *token_config,
+                         const char *content_type,
+                         const char *body,
+                         size_t body_len,
                          int client_fd) {
-    if (strcmp(method, "GET") != 0) {
-        return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+    int is_get = strcmp(method, "GET") == 0;
+    int is_post = strcmp(method, "POST") == 0;
+    if (!is_get && !is_post) {
+        return send_response(client_fd, 405, "Method Not Allowed", "unsupported method\n");
     }
 
     char path_buffer[HTTP_PATH_SIZE];
@@ -1483,30 +2222,58 @@ static int route_request(const char *root,
     }
 
     if (strcmp(decoded_path, "/submit") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_submit(root, query, client_fd);
     }
 
+    if (strcmp(decoded_path, "/upload") == 0) {
+        if (!is_post) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only POST supported\n");
+        }
+        return handle_upload(root, query, content_type, body, body_len, client_fd);
+    }
+
     if (strcmp(decoded_path, "/claim") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_claim(root, query, client_fd);
     }
 
     if (strcmp(decoded_path, "/release") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_release(root, query, client_fd);
     }
 
     if (strcmp(decoded_path, "/finalize") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_finalize(root, query, client_fd);
     }
 
     if (strcmp(decoded_path, "/move") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_move(root, query, client_fd);
     }
 
     if (strcmp(decoded_path, "/status") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_status(root, query, client_fd);
     }
 
     if (strcmp(decoded_path, "/retrieve") == 0) {
+        if (!is_get) {
+            return send_response(client_fd, 405, "Method Not Allowed", "only GET supported\n");
+        }
         return handle_retrieve(root, query, client_fd);
     }
 
@@ -2027,10 +2794,60 @@ static int test_build_panel_html(void) {
     if (!assert_true(strstr(html, "/metrics") != NULL, "panel metrics link present")) {
         return 0;
     }
+    if (!assert_true(strstr(html, "Submit OCR") != NULL, "panel upload form present")) {
+        return 0;
+    }
     if (!assert_true(build_panel_html("tok\"en", html, sizeof(html)), "build panel html with token")) {
         return 0;
     }
     if (!assert_true(strstr(html, "tok\\\"en") != NULL, "token escaped in html")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_multipart_parsing(void) {
+    const char *content_type = "multipart/form-data; boundary=bound";
+    char boundary[32];
+    if (!assert_true(parse_multipart_boundary(content_type, boundary, sizeof(boundary)),
+                     "parse multipart boundary")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(boundary, "bound") == 0, "boundary parsed")) {
+        return 0;
+    }
+    const char *body =
+        "--bound\r\n"
+        "Content-Disposition: form-data; name=\"output_dir\"\r\n\r\n"
+        "uploads\r\n"
+        "--bound\r\n"
+        "Content-Disposition: form-data; name=\"pdf\"; filename=\"sample.pdf\"\r\n\r\n"
+        "PDFDATA\r\n"
+        "--bound--\r\n";
+    const char *data = NULL;
+    size_t data_len = 0;
+    char filename[64];
+    if (!assert_true(parse_multipart_part(body, strlen(body), boundary, "pdf", &data, &data_len,
+                                          filename, sizeof(filename)),
+                     "parse multipart pdf")) {
+        return 0;
+    }
+    if (!assert_true(data_len == strlen("PDFDATA"), "pdf data length")) {
+        return 0;
+    }
+    if (!assert_true(strncmp(data, "PDFDATA", data_len) == 0, "pdf data content")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(filename, "sample.pdf") == 0, "pdf filename parsed")) {
+        return 0;
+    }
+    char output_dir[32];
+    if (!assert_true(read_multipart_text(body, strlen(body), boundary, "output_dir",
+                                         output_dir, sizeof(output_dir)),
+                     "read multipart output dir")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(output_dir, "uploads") == 0, "output dir parsed")) {
         return 0;
     }
     return 1;
@@ -2050,6 +2867,7 @@ int main(void) {
     passed &= test_build_log_path();
     passed &= test_json_escape();
     passed &= test_build_panel_html();
+    passed &= test_multipart_parsing();
 
     if (!passed) {
         fprintf(stderr, "HTTP helper tests failed.\n");

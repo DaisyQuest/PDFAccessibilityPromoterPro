@@ -24,6 +24,8 @@ typedef struct {
     int pdf_version_minor;
     size_t bytes_scanned;
     const char *provider_name;
+    size_t handwriting_marker_hits;
+    unsigned int handwriting_confidence;
 } pocr_report_t;
 
 typedef enum {
