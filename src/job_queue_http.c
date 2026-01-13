@@ -32,6 +32,7 @@
 #define HTTP_SOCKET_TIMEOUT_MS 1000
 #define HTTP_MAX_CHILDREN 32
 #define HTTP_METRICS_BUFFER 16384
+#define HTTP_PANEL_BUFFER 32768
 
 typedef enum {
     READ_OK = 0,
@@ -339,6 +340,163 @@ static int json_append(char *buffer, size_t buffer_len, size_t *offset, const ch
         return 0;
     }
     *offset += (size_t)written;
+    return 1;
+}
+
+static int build_panel_html(const char *token, char *output, size_t output_len) {
+    if (!output || output_len == 0) {
+        return 0;
+    }
+    const char *safe_token = token ? token : "";
+    char escaped_token[HTTP_UUID_SIZE * 2];
+    if (!json_escape(safe_token, escaped_token, sizeof(escaped_token))) {
+        return 0;
+    }
+    size_t offset = 0;
+    const char *chunks[] = {
+        "<!doctype html><html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<title>Job Queue Monitor</title>"
+        "<style>",
+        ":root{color-scheme:light;background:#0f172a;font-family:'Segoe UI',system-ui,sans-serif;color:#0f172a;}"
+        "body{margin:0;background:linear-gradient(135deg,#0f172a,#1e293b);} "
+        ".wrap{max-width:1100px;margin:0 auto;padding:32px;}"
+        ".hero{display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between;color:#f8fafc;}"
+        ".hero h1{margin:0;font-size:32px;letter-spacing:.5px;}"
+        ".hero p{margin:6px 0 0;color:#cbd5f5;}",
+        ".panel{margin-top:24px;background:#f8fafc;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(15,23,42,.35);}"
+        ".meta{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between;}"
+        ".meta .status{font-weight:600;color:#1e293b;}"
+        ".meta .timestamp{color:#64748b;font-size:14px;}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:20px;}"
+        ".card{background:white;border-radius:14px;padding:16px;border:1px solid #e2e8f0;}",
+        ".card h3{margin:0 0 8px;font-size:16px;color:#0f172a;}"
+        ".card .value{font-size:28px;font-weight:700;color:#2563eb;}"
+        ".card small{color:#64748b;display:block;margin-top:4px;}"
+        ".state-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:16px;}"
+        ".state{background:#f1f5f9;border-radius:12px;padding:12px;}"
+        ".state h4{margin:0 0 6px;font-size:14px;color:#1e293b;text-transform:uppercase;letter-spacing:.08em;}"
+        ".state .row{display:flex;justify-content:space-between;font-size:13px;color:#475569;}",
+        ".actions{display:flex;gap:12px;align-items:center;}"
+        "button{border:0;background:#2563eb;color:white;padding:10px 16px;border-radius:999px;font-weight:600;cursor:pointer;}"
+        "button:disabled{background:#94a3b8;cursor:not-allowed;}"
+        "a{color:#2563eb;text-decoration:none;font-weight:600;}"
+        ".pill{background:#e2e8f0;color:#1e293b;padding:4px 10px;border-radius:999px;font-size:12px;}"
+        ".error{color:#dc2626;font-weight:600;}"
+        "</style></head><body><div class=\"wrap\">"
+        "<section class=\"hero\"><div>"
+        "<h1>Job Queue Monitor</h1>"
+        "<p>Live visibility into queued, locked, and completed jobs.</p>"
+        "</div><div class=\"actions\">"
+        "<button id=\"refreshBtn\">Refresh now</button>"
+        "<a id=\"metricsLink\" href=\"#\" target=\"_blank\" rel=\"noreferrer\">Open metrics JSON</a>"
+        "</div></section>",
+        "<section class=\"panel\"><div class=\"meta\">"
+        "<div class=\"status\">Status: <span id=\"statusText\" class=\"pill\">Loading...</span></div>"
+        "<div class=\"timestamp\">Last updated: <span id=\"updatedAt\">--</span></div>"
+        "</div><div id=\"errorText\" class=\"error\" aria-live=\"polite\"></div>"
+        "<div class=\"grid\">"
+        "<div class=\"card\"><h3>Total files</h3><div id=\"totalFiles\" class=\"value\">0</div><small>Across all states</small></div>"
+        "<div class=\"card\"><h3>Locked jobs</h3><div id=\"totalLocked\" class=\"value\">0</div><small>Currently locked</small></div>"
+        "<div class=\"card\"><h3>Orphaned files</h3><div id=\"totalOrphans\" class=\"value\">0</div><small>Need attention</small></div>",
+        "<div class=\"card\"><h3>Stored bytes</h3><div id=\"totalBytes\" class=\"value\">0</div><small>On disk</small></div>"
+        "<div class=\"card\"><h3>Uptime</h3><div id=\"uptime\" class=\"value\">0s</div><small>Server runtime</small></div>"
+        "<div class=\"card\"><h3>Root path</h3><div id=\"rootPath\" class=\"value\" "
+        "style=\"font-size:14px;word-break:break-all;\">--</div><small>Job queue root</small></div>"
+        "</div><div class=\"state-grid\">",
+        "<div class=\"state\"><h4>Jobs</h4>"
+        "<div class=\"row\"><span>PDF</span><span id=\"jobsPdf\">0</span></div>"
+        "<div class=\"row\"><span>Metadata</span><span id=\"jobsMetadata\">0</span></div>"
+        "<div class=\"row\"><span>Reports</span><span id=\"jobsReport\">0</span></div>"
+        "<div class=\"row\"><span>Locked</span><span id=\"jobsLocked\">0</span></div>"
+        "<div class=\"row\"><span>Orphans</span><span id=\"jobsOrphans\">0</span></div>"
+        "</div>",
+        "<div class=\"state\"><h4>Priority</h4>"
+        "<div class=\"row\"><span>PDF</span><span id=\"priorityPdf\">0</span></div>"
+        "<div class=\"row\"><span>Metadata</span><span id=\"priorityMetadata\">0</span></div>"
+        "<div class=\"row\"><span>Reports</span><span id=\"priorityReport\">0</span></div>"
+        "<div class=\"row\"><span>Locked</span><span id=\"priorityLocked\">0</span></div>"
+        "<div class=\"row\"><span>Orphans</span><span id=\"priorityOrphans\">0</span></div>"
+        "</div>",
+        "<div class=\"state\"><h4>Complete</h4>"
+        "<div class=\"row\"><span>PDF</span><span id=\"completePdf\">0</span></div>"
+        "<div class=\"row\"><span>Metadata</span><span id=\"completeMetadata\">0</span></div>"
+        "<div class=\"row\"><span>Reports</span><span id=\"completeReport\">0</span></div>"
+        "<div class=\"row\"><span>Locked</span><span id=\"completeLocked\">0</span></div>"
+        "<div class=\"row\"><span>Orphans</span><span id=\"completeOrphans\">0</span></div>"
+        "</div>",
+        "<div class=\"state\"><h4>Error</h4>"
+        "<div class=\"row\"><span>PDF</span><span id=\"errorPdf\">0</span></div>"
+        "<div class=\"row\"><span>Metadata</span><span id=\"errorMetadata\">0</span></div>"
+        "<div class=\"row\"><span>Reports</span><span id=\"errorReport\">0</span></div>"
+        "<div class=\"row\"><span>Locked</span><span id=\"errorLocked\">0</span></div>"
+        "<div class=\"row\"><span>Orphans</span><span id=\"errorOrphans\">0</span></div>"
+        "</div></div></section></div><script>"
+    };
+    for (size_t i = 0; i < sizeof(chunks) / sizeof(chunks[0]); ++i) {
+        if (!json_append(output, output_len, &offset, "%s", chunks[i])) {
+            return 0;
+        }
+    }
+    if (!json_append(output, output_len, &offset,
+                     "const token = \"%s\";"
+                     "const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : \"\";"
+                     "const metricsUrl = `/metrics${tokenQuery}`;"
+                     "const refreshBtn = document.getElementById('refreshBtn');"
+                     "const metricsLink = document.getElementById('metricsLink');"
+                     "metricsLink.href = metricsUrl;"
+                     "const errorText = document.getElementById('errorText');",
+                     escaped_token)) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "function formatBytes(bytes){"
+                     "if(bytes < 1024){return `${bytes} B`;}const units=['KB','MB','GB','TB'];"
+                     "let value=bytes;let idx=-1;while(value>=1024 && idx<units.length-1){value/=1024;idx++;}"
+                     "return `${value.toFixed(1)} ${units[idx]}`;}"
+                     "function setText(id, value){const el=document.getElementById(id);if(el){el.textContent=value;}}"
+                     "function setState(prefix, state){"
+                     "setText(`${prefix}Pdf`, state.pdf);"
+                     "setText(`${prefix}Metadata`, state.metadata);"
+                     "setText(`${prefix}Report`, state.report);"
+                     "setText(`${prefix}Locked`, state.locked_pdf + state.locked_metadata + state.locked_report);"
+                     "setText(`${prefix}Orphans`, state.orphan_pdf + state.orphan_metadata + state.orphan_report);"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "function updatePanel(data){"
+                     "setText('statusText', data.status || 'unknown');"
+                     "setText('updatedAt', new Date().toLocaleString());"
+                     "setText('totalFiles', data.totals.files);"
+                     "setText('totalLocked', data.totals.locked);"
+                     "setText('totalOrphans', data.totals.orphans);"
+                     "setText('totalBytes', formatBytes(data.totals.bytes));"
+                     "setText('uptime', `${data.uptime_seconds}s`);"
+                     "setText('rootPath', data.root);"
+                     "setState('jobs', data.states.jobs);"
+                     "setState('priority', data.states.priority);"
+                     "setState('complete', data.states.complete);"
+                     "setState('error', data.states.error);"
+                     "}")) {
+        return 0;
+    }
+    if (!json_append(output, output_len, &offset,
+                     "async function fetchMetrics(){"
+                     "refreshBtn.disabled=true;errorText.textContent='';"
+                     "try{const res=await fetch(metricsUrl,{cache:'no-store'});"
+                     "if(!res.ok){throw new Error(`HTTP ${res.status}`);}const data=await res.json();"
+                     "updatePanel(data);}catch(err){errorText.textContent=`Unable to load metrics: ${err.message}`;}"
+                     "finally{refreshBtn.disabled=false;}}"
+                     "refreshBtn.addEventListener('click', fetchMetrics);"
+                     "fetchMetrics();"
+                     "setInterval(fetchMetrics, 5000);"
+                     "</script>"
+                     "</body>"
+                     "</html>")) {
+        return 0;
+    }
     return 1;
 }
 
@@ -1151,6 +1309,20 @@ static int handle_metrics(const char *root, int client_fd) {
     return send_response_with_type(client_fd, 200, "OK", "application/json", body);
 }
 
+static int handle_panel(const char *query, int client_fd) {
+    char token_value[HTTP_UUID_SIZE];
+    const char *token = "";
+    if (get_query_param(query, "token", token_value, sizeof(token_value))) {
+        token = token_value;
+    }
+
+    char body[HTTP_PANEL_BUFFER];
+    if (!build_panel_html(token, body, sizeof(body))) {
+        return send_response(client_fd, 500, "Internal Server Error", "panel too large\n");
+    }
+    return send_response_with_type(client_fd, 200, "OK", "text/html; charset=utf-8", body);
+}
+
 static int is_authorized(const char *token_config, const char *auth_header, const char *query) {
     if (!token_config || token_config[0] == '\0') {
         return 1;
@@ -1304,6 +1476,10 @@ static int route_request(const char *root,
 
     if (strcmp(decoded_path, "/metrics") == 0) {
         return handle_metrics(root, client_fd);
+    }
+
+    if (strcmp(decoded_path, "/") == 0 || strcmp(decoded_path, "/panel") == 0) {
+        return handle_panel(query, client_fd);
     }
 
     if (strcmp(decoded_path, "/submit") == 0) {
@@ -1840,6 +2016,26 @@ static int test_json_escape(void) {
     return 1;
 }
 
+static int test_build_panel_html(void) {
+    char html[HTTP_PANEL_BUFFER];
+    if (!assert_true(build_panel_html(NULL, html, sizeof(html)), "build panel html without token")) {
+        return 0;
+    }
+    if (!assert_true(strstr(html, "Job Queue Monitor") != NULL, "panel title present")) {
+        return 0;
+    }
+    if (!assert_true(strstr(html, "/metrics") != NULL, "panel metrics link present")) {
+        return 0;
+    }
+    if (!assert_true(build_panel_html("tok\"en", html, sizeof(html)), "build panel html with token")) {
+        return 0;
+    }
+    if (!assert_true(strstr(html, "tok\\\"en") != NULL, "token escaped in html")) {
+        return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_url_decode();
@@ -1853,6 +2049,7 @@ int main(void) {
     passed &= test_resolve_existing_under_root();
     passed &= test_build_log_path();
     passed &= test_json_escape();
+    passed &= test_build_panel_html();
 
     if (!passed) {
         fprintf(stderr, "HTTP helper tests failed.\n");

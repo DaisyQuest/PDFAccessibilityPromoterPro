@@ -61,3 +61,4 @@
 ## Developer Experience
 - [x] Cross-platform server demo scripts added.
 - [x] Makefile job processor shortcuts added.
+- [x] Local monitoring panel and launcher scripts added.
