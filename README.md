@@ -39,6 +39,8 @@ You can also collect stats directly from disk:
 
 The HTTP server includes a built-in monitoring panel at `/panel` (and `/`). It refreshes every few seconds and uses the same token settings as the JSON metrics endpoint.
 
+The panel also includes worker controls for running OCR, redaction, and analysis jobs directly against the queue during local development.
+
 ```sh
 ./job_queue_http <root> <port>
 open http://127.0.0.1:<port>/panel
