@@ -200,11 +200,56 @@ static int test_cli_release(void) {
     return 1;
 }
 
+static int test_cli_stats(void) {
+    char template[] = "/tmp/pap_test_cli_stats_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    snprintf(command, sizeof(command), "./job_queue_cli init %s", root);
+    if (!assert_true(run_command(command) == 0, "cli init stats")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf stats source")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata stats source")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_submit(root, "job-stats", pdf_src, metadata_src, 0) == JQ_OK, "submit stats job")) {
+        return 0;
+    }
+
+    char output[1024];
+    snprintf(command, sizeof(command), "./job_queue_cli stats %s", root);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "cli stats output")) {
+        return 0;
+    }
+    if (!assert_true(strstr(output, "jobs:") != NULL, "stats output has jobs")) {
+        return 0;
+    }
+    if (!assert_true(strstr(output, "totals:") != NULL, "stats output has totals")) {
+        return 0;
+    }
+
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_cli_submit_claim_finalize();
     passed &= test_cli_claim_empty();
     passed &= test_cli_release();
+    passed &= test_cli_stats();
 
     if (!passed) {
         fprintf(stderr, "Some CLI tests failed.\n");

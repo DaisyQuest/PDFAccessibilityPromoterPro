@@ -1101,6 +1101,65 @@ static int test_http_invalid_uuid_and_path(void) {
     return 1;
 }
 
+static int test_http_metrics(void) {
+    char template[] = "/tmp/pap_test_http_metrics_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init root for metrics")) {
+        return 0;
+    }
+
+    const char *pdf_rel = "source.pdf";
+    const char *metadata_rel = "source.metadata";
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/%s", root, pdf_rel);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/%s", root, metadata_rel);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf for metrics")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata for metrics")) {
+        return 0;
+    }
+    if (!assert_true(jq_submit(root, "metrics-job", pdf_src, metadata_src, 0) == JQ_OK,
+                     "submit metrics job")) {
+        return 0;
+    }
+
+    pid_t pid = 0;
+    int port = 9116;
+    if (!assert_true(start_server(root, port, NULL, &pid), "start server for metrics")) {
+        return 0;
+    }
+
+    char command[COMMAND_BUFFER];
+    char output[RESPONSE_BUFFER];
+    snprintf(command, sizeof(command), "curl -s http://127.0.0.1:%d/metrics", port);
+    if (!assert_true(read_command_output(command, output, sizeof(output)), "metrics request")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "\"status\":\"ok\"") != NULL, "metrics status ok")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "\"states\"") != NULL, "metrics states present")) {
+        stop_server(pid);
+        return 0;
+    }
+    if (!assert_true(strstr(output, "\"totals\"") != NULL, "metrics totals present")) {
+        stop_server(pid);
+        return 0;
+    }
+
+    stop_server(pid);
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_http_submit_claim_finalize();
@@ -1121,6 +1180,7 @@ int main(void) {
     passed &= test_http_auth_token();
     passed &= test_http_url_decoding();
     passed &= test_http_invalid_uuid_and_path();
+    passed &= test_http_metrics();
 
     if (!passed) {
         fprintf(stderr, "Some HTTP tests failed.\n");

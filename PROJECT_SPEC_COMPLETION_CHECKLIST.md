@@ -10,7 +10,7 @@
 - [x] Accessibility transformations documentation created.
 
 ## Core Architecture
-- [ ] Job queue server core implemented.
+- [x] Job queue server core implemented.
 - [x] Job lifecycle (jobs/priority/complete/error) implemented.
 - [x] Worker claiming, locking, and recovery implemented.
 - [ ] Remote worker support implemented.

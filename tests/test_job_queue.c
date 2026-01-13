@@ -221,10 +221,143 @@ static int test_report_paths_invalid(void) {
                        "jq_job_report_paths should reject NULL buffer");
 }
 
+static int test_collect_stats_invalid(void) {
+    jq_stats_t stats;
+    return assert_true(jq_collect_stats(NULL, &stats) == JQ_ERR_INVALID_ARGUMENT,
+                       "jq_collect_stats should reject NULL root") &&
+           assert_true(jq_collect_stats("/tmp", NULL) == JQ_ERR_INVALID_ARGUMENT,
+                       "jq_collect_stats should reject NULL stats");
+}
+
 static int test_job_paths_overflow(void) {
     char small[8];
     jq_result_t result = jq_job_paths("/tmp", "averylonguuid", JQ_STATE_JOBS, small, sizeof(small), small, sizeof(small));
     return assert_true(result == JQ_ERR_INVALID_ARGUMENT, "jq_job_paths should detect overflow");
+}
+
+static int test_collect_stats(void) {
+    char template[] = "/tmp/pap_test_stats_XXXXXX";
+    char *root = mkdtemp(template);
+    if (!root) {
+        perror("mkdtemp failed");
+        return 0;
+    }
+
+    if (!assert_true(jq_init(root) == JQ_OK, "init stats root")) {
+        return 0;
+    }
+
+    char pdf_src[PATH_MAX];
+    char metadata_src[PATH_MAX];
+    snprintf(pdf_src, sizeof(pdf_src), "%s/source.pdf", root);
+    snprintf(metadata_src, sizeof(metadata_src), "%s/source.metadata", root);
+    if (!assert_true(write_file(pdf_src, "pdf data"), "write pdf stats source")) {
+        return 0;
+    }
+    if (!assert_true(write_file(metadata_src, "metadata"), "write metadata stats source")) {
+        return 0;
+    }
+
+    if (!assert_true(jq_submit(root, "jobs-job", pdf_src, metadata_src, 0) == JQ_OK, "submit jobs job")) {
+        return 0;
+    }
+    if (!assert_true(jq_submit(root, "priority-job", pdf_src, metadata_src, 1) == JQ_OK,
+                     "submit priority job")) {
+        return 0;
+    }
+    if (!assert_true(jq_submit(root, "complete-job", pdf_src, metadata_src, 0) == JQ_OK,
+                     "submit complete job")) {
+        return 0;
+    }
+    if (!assert_true(jq_move(root, "complete-job", JQ_STATE_JOBS, JQ_STATE_COMPLETE) == JQ_OK,
+                     "move complete job")) {
+        return 0;
+    }
+
+    char report_path[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "complete-job", JQ_STATE_COMPLETE,
+                                         report_path, sizeof(report_path)) == JQ_OK,
+                     "report path stats")) {
+        return 0;
+    }
+    if (!assert_true(write_report_file(report_path), "write report stats")) {
+        return 0;
+    }
+
+    char orphan_report[PATH_MAX];
+    if (!assert_true(jq_job_report_paths(root, "orphan-report", JQ_STATE_COMPLETE,
+                                         orphan_report, sizeof(orphan_report)) == JQ_OK,
+                     "orphan report path")) {
+        return 0;
+    }
+    if (!assert_true(write_report_file(orphan_report), "write orphan report")) {
+        return 0;
+    }
+
+    char orphan_metadata[PATH_MAX];
+    if (!assert_true(jq_job_paths(root, "orphan-metadata", JQ_STATE_ERROR,
+                                  pdf_src, sizeof(pdf_src),
+                                  orphan_metadata, sizeof(orphan_metadata)) == JQ_OK,
+                     "orphan metadata path")) {
+        return 0;
+    }
+    if (!assert_true(write_file(orphan_metadata, "orphan"), "write orphan metadata")) {
+        return 0;
+    }
+
+    char claimed_uuid[128];
+    jq_state_t claimed_state = JQ_STATE_JOBS;
+    if (!assert_true(jq_claim_next(root, 1, claimed_uuid, sizeof(claimed_uuid), &claimed_state) == JQ_OK,
+                     "claim priority job")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(claimed_uuid, "priority-job") == 0, "claimed priority job")) {
+        return 0;
+    }
+
+    jq_stats_t stats;
+    if (!assert_true(jq_collect_stats(root, &stats) == JQ_OK, "collect stats")) {
+        return 0;
+    }
+
+    if (!assert_true(stats.states[JQ_STATE_JOBS].pdf_jobs == 1, "jobs pdf count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_JOBS].metadata_jobs == 1, "jobs metadata count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_PRIORITY].pdf_locked == 1, "priority locked pdf count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_PRIORITY].metadata_locked == 1, "priority locked metadata count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_COMPLETE].report_jobs == 2, "complete report count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_COMPLETE].orphan_report == 1, "complete orphan report count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_ERROR].metadata_jobs == 1, "error metadata count")) {
+        return 0;
+    }
+    if (!assert_true(stats.states[JQ_STATE_ERROR].orphan_metadata == 1, "error orphan metadata count")) {
+        return 0;
+    }
+    if (!assert_true(stats.total_jobs > 0, "total jobs tracked")) {
+        return 0;
+    }
+    if (!assert_true(stats.total_locked > 0, "total locked tracked")) {
+        return 0;
+    }
+    if (!assert_true(stats.total_orphans >= 2, "total orphans tracked")) {
+        return 0;
+    }
+    if (!assert_true(stats.total_bytes > 0, "total bytes tracked")) {
+        return 0;
+    }
+
+    return 1;
 }
 
 static int test_submit_and_move(void) {
@@ -1281,7 +1414,9 @@ int main(void) {
     passed &= test_init_empty();
     passed &= test_job_paths_invalid();
     passed &= test_report_paths_invalid();
+    passed &= test_collect_stats_invalid();
     passed &= test_job_paths_overflow();
+    passed &= test_collect_stats();
     passed &= test_submit_and_move();
     passed &= test_submit_missing_source();
     passed &= test_submit_metadata_cleanup();

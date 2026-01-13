@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -30,6 +31,7 @@
 #define HTTP_HEADERS_TIMEOUT_MS 5000
 #define HTTP_SOCKET_TIMEOUT_MS 1000
 #define HTTP_MAX_CHILDREN 32
+#define HTTP_METRICS_BUFFER 16384
 
 typedef enum {
     READ_OK = 0,
@@ -42,6 +44,16 @@ typedef enum {
 static int url_decode(const char *src, char *dst, size_t dst_len);
 
 static volatile sig_atomic_t active_children = 0;
+static struct timespec server_start_time;
+static int server_start_set = 0;
+
+static void record_server_start(void) {
+    if (!server_start_set) {
+        if (clock_gettime(CLOCK_MONOTONIC, &server_start_time) == 0) {
+            server_start_set = 1;
+        }
+    }
+}
 
 static void handle_sigchld(int signal_id) {
     (void)signal_id;
@@ -68,21 +80,29 @@ static int write_all(int fd, const char *buffer, size_t length) {
     return 200;
 }
 
-static int send_response(int client_fd, int status, const char *status_text, const char *body) {
+static int send_response_with_type(int client_fd,
+                                   int status,
+                                   const char *status_text,
+                                   const char *content_type,
+                                   const char *body) {
     char response[HTTP_BUFFER_SIZE];
     int body_len = body ? (int)strlen(body) : 0;
     int written = snprintf(response, sizeof(response),
                            "HTTP/1.1 %d %s\r\n"
-                           "Content-Type: text/plain\r\n"
+                           "Content-Type: %s\r\n"
                            "Content-Length: %d\r\n"
                            "Connection: close\r\n\r\n"
                            "%s",
-                           status, status_text, body_len, body ? body : "");
+                           status, status_text, content_type, body_len, body ? body : "");
     if (written < 0 || (size_t)written >= sizeof(response)) {
         return status;
     }
     write_all(client_fd, response, (size_t)written);
     return status;
+}
+
+static int send_response(int client_fd, int status, const char *status_text, const char *body) {
+    return send_response_with_type(client_fd, status, status_text, "text/plain", body);
 }
 
 static long long elapsed_ms(const struct timespec *start, const struct timespec *now) {
@@ -247,6 +267,114 @@ static int constant_time_equals(const char *a, const char *b) {
         result |= (unsigned char)(a[i] ^ b[i]);
     }
     return result == 0;
+}
+
+static long long uptime_seconds(void) {
+    struct timespec now;
+    if (!server_start_set) {
+        return 0;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    long long seconds = now.tv_sec - server_start_time.tv_sec;
+    if (seconds < 0) {
+        return 0;
+    }
+    return seconds;
+}
+
+static int json_escape(const char *input, char *output, size_t output_len) {
+    if (!input || !output || output_len == 0) {
+        return 0;
+    }
+    size_t out = 0;
+    for (size_t i = 0; input[i] != '\0'; ++i) {
+        unsigned char ch = (unsigned char)input[i];
+        const char *escape = NULL;
+        char scratch[7];
+        if (ch == '\\') {
+            escape = "\\\\";
+        } else if (ch == '"') {
+            escape = "\\\"";
+        } else if (ch == '\n') {
+            escape = "\\n";
+        } else if (ch == '\r') {
+            escape = "\\r";
+        } else if (ch == '\t') {
+            escape = "\\t";
+        } else if (ch < 0x20) {
+            snprintf(scratch, sizeof(scratch), "\\u%04x", ch);
+            escape = scratch;
+        }
+
+        if (escape) {
+            size_t escape_len = strlen(escape);
+            if (out + escape_len + 1 > output_len) {
+                return 0;
+            }
+            memcpy(output + out, escape, escape_len);
+            out += escape_len;
+            continue;
+        }
+
+        if (out + 2 > output_len) {
+            return 0;
+        }
+        output[out++] = (char)ch;
+    }
+    output[out] = '\0';
+    return 1;
+}
+
+static int json_append(char *buffer, size_t buffer_len, size_t *offset, const char *fmt, ...) {
+    if (!buffer || !offset || *offset >= buffer_len) {
+        return 0;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buffer + *offset, buffer_len - *offset, fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= buffer_len - *offset) {
+        return 0;
+    }
+    *offset += (size_t)written;
+    return 1;
+}
+
+static int append_state_metrics(char *buffer,
+                                size_t buffer_len,
+                                size_t *offset,
+                                const char *label,
+                                const jq_state_stats_t *stats) {
+    return json_append(buffer, buffer_len, offset,
+                       "\"%s\":{"
+                       "\"pdf\":%zu,"
+                       "\"metadata\":%zu,"
+                       "\"report\":%zu,"
+                       "\"locked_pdf\":%zu,"
+                       "\"locked_metadata\":%zu,"
+                       "\"locked_report\":%zu,"
+                       "\"orphan_pdf\":%zu,"
+                       "\"orphan_metadata\":%zu,"
+                       "\"orphan_report\":%zu,"
+                       "\"bytes_pdf\":%llu,"
+                       "\"bytes_metadata\":%llu,"
+                       "\"bytes_report\":%llu"
+                       "}",
+                       label,
+                       stats->pdf_jobs,
+                       stats->metadata_jobs,
+                       stats->report_jobs,
+                       stats->pdf_locked,
+                       stats->metadata_locked,
+                       stats->report_locked,
+                       stats->orphan_pdf,
+                       stats->orphan_metadata,
+                       stats->orphan_report,
+                       stats->pdf_bytes,
+                       stats->metadata_bytes,
+                       stats->report_bytes);
 }
 
 static void sanitize_for_log(const char *input, char *output, size_t output_len) {
@@ -948,6 +1076,81 @@ static int handle_retrieve(const char *root, const char *query, int client_fd) {
     return 200;
 }
 
+static int handle_metrics(const char *root, int client_fd) {
+    jq_stats_t stats;
+    jq_result_t result = jq_collect_stats(root, &stats);
+    if (result == JQ_ERR_NOT_FOUND) {
+        return send_response(client_fd, 404, "Not Found", "job root not found\n");
+    }
+    if (result != JQ_OK) {
+        return send_response(client_fd, 500, "Internal Server Error", "unable to read stats\n");
+    }
+
+    record_server_start();
+    char escaped_root[PATH_MAX * 2];
+    if (!json_escape(root, escaped_root, sizeof(escaped_root))) {
+        return send_response(client_fd, 500, "Internal Server Error", "failed to encode root\n");
+    }
+
+    char body[HTTP_METRICS_BUFFER];
+    size_t offset = 0;
+    time_t now = time(NULL);
+
+    if (!json_append(body, sizeof(body), &offset,
+                     "{"
+                     "\"status\":\"ok\","
+                     "\"timestamp_epoch\":%lld,"
+                     "\"uptime_seconds\":%lld,"
+                     "\"root\":\"%s\","
+                     "\"limits\":{"
+                     "\"max_children\":%d,"
+                     "\"max_request_bytes\":%d,"
+                     "\"max_header_lines\":%d,"
+                     "\"request_line_timeout_ms\":%d,"
+                     "\"headers_timeout_ms\":%d,"
+                     "\"socket_timeout_ms\":%d"
+                     "},"
+                     "\"totals\":{"
+                     "\"files\":%zu,"
+                     "\"locked\":%zu,"
+                     "\"orphans\":%zu,"
+                     "\"bytes\":%llu,"
+                     "\"oldest_mtime\":%lld,"
+                     "\"newest_mtime\":%lld"
+                     "},"
+                     "\"states\":{",
+                     (long long)now,
+                     uptime_seconds(),
+                     escaped_root,
+                     HTTP_MAX_CHILDREN,
+                     HTTP_MAX_REQUEST_BYTES,
+                     HTTP_MAX_HEADER_LINES,
+                     HTTP_REQUEST_LINE_TIMEOUT_MS,
+                     HTTP_HEADERS_TIMEOUT_MS,
+                     HTTP_SOCKET_TIMEOUT_MS,
+                     stats.total_jobs,
+                     stats.total_locked,
+                     stats.total_orphans,
+                     stats.total_bytes,
+                     (long long)stats.oldest_mtime,
+                     (long long)stats.newest_mtime)) {
+        return send_response(client_fd, 500, "Internal Server Error", "metrics too large\n");
+    }
+
+    if (!append_state_metrics(body, sizeof(body), &offset, "jobs", &stats.states[JQ_STATE_JOBS]) ||
+        !json_append(body, sizeof(body), &offset, ",") ||
+        !append_state_metrics(body, sizeof(body), &offset, "priority", &stats.states[JQ_STATE_PRIORITY]) ||
+        !json_append(body, sizeof(body), &offset, ",") ||
+        !append_state_metrics(body, sizeof(body), &offset, "complete", &stats.states[JQ_STATE_COMPLETE]) ||
+        !json_append(body, sizeof(body), &offset, ",") ||
+        !append_state_metrics(body, sizeof(body), &offset, "error", &stats.states[JQ_STATE_ERROR]) ||
+        !json_append(body, sizeof(body), &offset, "}}")) {
+        return send_response(client_fd, 500, "Internal Server Error", "metrics too large\n");
+    }
+
+    return send_response_with_type(client_fd, 200, "OK", "application/json", body);
+}
+
 static int is_authorized(const char *token_config, const char *auth_header, const char *query) {
     if (!token_config || token_config[0] == '\0') {
         return 1;
@@ -1099,6 +1302,10 @@ static int route_request(const char *root,
         return send_response(client_fd, 401, "Unauthorized", "unauthorized\n");
     }
 
+    if (strcmp(decoded_path, "/metrics") == 0) {
+        return handle_metrics(root, client_fd);
+    }
+
     if (strcmp(decoded_path, "/submit") == 0) {
         return handle_submit(root, query, client_fd);
     }
@@ -1208,6 +1415,8 @@ int main(int argc, char **argv) {
         close(server_fd);
         return 1;
     }
+
+    record_server_start();
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -1610,6 +1819,27 @@ static int test_build_log_path(void) {
     return 1;
 }
 
+static int test_json_escape(void) {
+    char escaped[64];
+    if (!assert_true(json_escape("path\"\\\n", escaped, sizeof(escaped)), "json escape special chars")) {
+        return 0;
+    }
+    if (!assert_true(strcmp(escaped, "path\\\"\\\\\\n") == 0, "json escaped output")) {
+        return 0;
+    }
+    char control_input[3];
+    control_input[0] = 'a';
+    control_input[1] = 1;
+    control_input[2] = '\0';
+    if (!assert_true(json_escape(control_input, escaped, sizeof(escaped)), "json escape control")) {
+        return 0;
+    }
+    if (!assert_true(strstr(escaped, "\\u0001") != NULL, "json escape control value")) {
+        return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     int passed = 1;
     passed &= test_url_decode();
@@ -1622,6 +1852,7 @@ int main(void) {
     passed &= test_query_param_and_root_paths();
     passed &= test_resolve_existing_under_root();
     passed &= test_build_log_path();
+    passed &= test_json_escape();
 
     if (!passed) {
         fprintf(stderr, "HTTP helper tests failed.\n");
