@@ -12,6 +12,7 @@ static void print_usage(void) {
     printf("  job_queue_cli release <root> <uuid> <state>\n");
     printf("  job_queue_cli finalize <root> <uuid> <from_state> <to_state>\n");
     printf("  job_queue_cli move <root> <uuid> <from_state> <to_state>\n");
+    printf("  job_queue_cli stats <root>\n");
 }
 
 static const char *state_to_string(jq_state_t state) {
@@ -66,6 +67,34 @@ static int exit_for_result(jq_result_t result) {
             fprintf(stderr, "io error\n");
             return 1;
     }
+}
+
+static void print_state_stats(const char *label, const jq_state_stats_t *stats) {
+    printf("%s:\n", label);
+    printf("  pdf=%zu metadata=%zu report=%zu\n", stats->pdf_jobs, stats->metadata_jobs, stats->report_jobs);
+    printf("  locked_pdf=%zu locked_metadata=%zu locked_report=%zu\n",
+           stats->pdf_locked, stats->metadata_locked, stats->report_locked);
+    printf("  orphan_pdf=%zu orphan_metadata=%zu orphan_report=%zu\n",
+           stats->orphan_pdf, stats->orphan_metadata, stats->orphan_report);
+    printf("  bytes_pdf=%llu bytes_metadata=%llu bytes_report=%llu\n",
+           stats->pdf_bytes, stats->metadata_bytes, stats->report_bytes);
+}
+
+static int handle_stats(const char *root) {
+    jq_stats_t stats;
+    jq_result_t result = jq_collect_stats(root, &stats);
+    if (result != JQ_OK) {
+        return exit_for_result(result);
+    }
+
+    print_state_stats("jobs", &stats.states[JQ_STATE_JOBS]);
+    print_state_stats("priority", &stats.states[JQ_STATE_PRIORITY]);
+    print_state_stats("complete", &stats.states[JQ_STATE_COMPLETE]);
+    print_state_stats("error", &stats.states[JQ_STATE_ERROR]);
+    printf("totals: files=%zu locked=%zu orphans=%zu bytes=%llu oldest_mtime=%lld newest_mtime=%lld\n",
+           stats.total_jobs, stats.total_locked, stats.total_orphans, stats.total_bytes,
+           (long long)stats.oldest_mtime, (long long)stats.newest_mtime);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -161,6 +190,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         return exit_for_result(jq_move(argv[2], argv[3], from_state, to_state));
+    }
+
+    if (strcmp(command, "stats") == 0) {
+        if (argc != 3) {
+            print_usage();
+            return 1;
+        }
+        return handle_stats(argv[2]);
     }
 
     print_usage();

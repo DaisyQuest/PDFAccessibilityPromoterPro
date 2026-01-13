@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *jq_state_dir(jq_state_t state) {
@@ -509,6 +510,182 @@ static int jq_has_suffix(const char *name, const char *suffix) {
     return strcmp(name + name_len - suffix_len, suffix) == 0;
 }
 
+static void jq_update_mtime(time_t mtime, time_t *oldest, time_t *newest) {
+    if (mtime <= 0) {
+        return;
+    }
+    if (*oldest == 0 || mtime < *oldest) {
+        *oldest = mtime;
+    }
+    if (*newest == 0 || mtime > *newest) {
+        *newest = mtime;
+    }
+}
+
+static int jq_build_dir_path(const char *root_path, const char *dir_name, char *out, size_t out_len) {
+    int written = snprintf(out, out_len, "%s/%s", root_path, dir_name);
+    if (written < 0 || (size_t)written >= out_len) {
+        return 0;
+    }
+    return 1;
+}
+
+static int jq_build_entry_path(const char *dir_path, const char *name, char *out, size_t out_len) {
+    int written = snprintf(out, out_len, "%s/%s", dir_path, name);
+    if (written < 0 || (size_t)written >= out_len) {
+        return 0;
+    }
+    return 1;
+}
+
+static int jq_check_counterpart(const char *dir_path,
+                                const char *name,
+                                const char *suffix,
+                                const char *counter_suffix) {
+    size_t name_len = strlen(name);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > name_len) {
+        return 0;
+    }
+    size_t base_len = name_len - suffix_len;
+    char counterpart[PATH_MAX];
+    if (base_len + strlen(counter_suffix) + 1 > sizeof(counterpart)) {
+        return 0;
+    }
+    memcpy(counterpart, name, base_len);
+    memcpy(counterpart + base_len, counter_suffix, strlen(counter_suffix) + 1);
+
+    char path[PATH_MAX];
+    if (!jq_build_entry_path(dir_path, counterpart, path, sizeof(path))) {
+        return 0;
+    }
+    if (access(path, F_OK) == 0) {
+        return 1;
+    }
+    if (errno == ENOENT) {
+        return 0;
+    }
+    return 1;
+}
+
+static jq_result_t jq_collect_state_stats(const char *root_path,
+                                          jq_state_t state,
+                                          jq_state_stats_t *stats,
+                                          time_t *oldest_mtime,
+                                          time_t *newest_mtime) {
+    if (!root_path || !stats) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    const char *dir_name = jq_state_dir(state);
+    if (!dir_name) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    char dir_path[PATH_MAX];
+    if (!jq_build_dir_path(root_path, dir_name, dir_path, sizeof(dir_path))) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        return errno == ENOENT ? JQ_ERR_NOT_FOUND : JQ_ERR_IO;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+
+        const char *suffix = NULL;
+        enum {
+            JQ_FILE_UNKNOWN = 0,
+            JQ_FILE_PDF = 1,
+            JQ_FILE_METADATA = 2,
+            JQ_FILE_REPORT = 3
+        } file_type = JQ_FILE_UNKNOWN;
+        int locked = 0;
+
+        if (jq_has_suffix(name, ".pdf.job.lock")) {
+            suffix = ".pdf.job.lock";
+            file_type = JQ_FILE_PDF;
+            locked = 1;
+        } else if (jq_has_suffix(name, ".pdf.job")) {
+            suffix = ".pdf.job";
+            file_type = JQ_FILE_PDF;
+        } else if (jq_has_suffix(name, ".metadata.job.lock")) {
+            suffix = ".metadata.job.lock";
+            file_type = JQ_FILE_METADATA;
+            locked = 1;
+        } else if (jq_has_suffix(name, ".metadata.job")) {
+            suffix = ".metadata.job";
+            file_type = JQ_FILE_METADATA;
+        } else if (jq_has_suffix(name, ".report.html.lock")) {
+            suffix = ".report.html.lock";
+            file_type = JQ_FILE_REPORT;
+            locked = 1;
+        } else if (jq_has_suffix(name, ".report.html")) {
+            suffix = ".report.html";
+            file_type = JQ_FILE_REPORT;
+        } else {
+            continue;
+        }
+
+        char path[PATH_MAX];
+        if (!jq_build_entry_path(dir_path, name, path, sizeof(path))) {
+            closedir(dir);
+            return JQ_ERR_INVALID_ARGUMENT;
+        }
+
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            closedir(dir);
+            return JQ_ERR_IO;
+        }
+        jq_update_mtime(st.st_mtime, oldest_mtime, newest_mtime);
+
+        if (file_type == JQ_FILE_PDF) {
+            if (locked) {
+                stats->pdf_locked++;
+            } else {
+                stats->pdf_jobs++;
+            }
+            stats->pdf_bytes += (unsigned long long)st.st_size;
+            const char *counter_suffix = locked ? ".metadata.job.lock" : ".metadata.job";
+            if (!jq_check_counterpart(dir_path, name, suffix, counter_suffix)) {
+                stats->orphan_pdf++;
+            }
+        } else if (file_type == JQ_FILE_METADATA) {
+            if (locked) {
+                stats->metadata_locked++;
+            } else {
+                stats->metadata_jobs++;
+            }
+            stats->metadata_bytes += (unsigned long long)st.st_size;
+            const char *counter_suffix = locked ? ".pdf.job.lock" : ".pdf.job";
+            if (!jq_check_counterpart(dir_path, name, suffix, counter_suffix)) {
+                stats->orphan_metadata++;
+            }
+        } else if (file_type == JQ_FILE_REPORT) {
+            if (locked) {
+                stats->report_locked++;
+            } else {
+                stats->report_jobs++;
+            }
+            stats->report_bytes += (unsigned long long)st.st_size;
+            const char *counter_suffix = locked ? ".pdf.job.lock" : ".pdf.job";
+            if (!jq_check_counterpart(dir_path, name, suffix, counter_suffix)) {
+                stats->orphan_report++;
+            }
+        }
+    }
+
+    closedir(dir);
+    return JQ_OK;
+}
+
 static jq_result_t jq_claim_in_dir(const char *root_path,
                                    const char *dir_name,
                                    jq_state_t state,
@@ -748,6 +925,37 @@ jq_result_t jq_finalize(const char *root_path,
         jq_rename(metadata_dest, metadata_locked);
         jq_rename(pdf_dest, pdf_locked);
         return report_move;
+    }
+
+    return JQ_OK;
+}
+
+jq_result_t jq_collect_stats(const char *root_path,
+                             jq_stats_t *stats_out) {
+    if (!root_path || !stats_out) {
+        return JQ_ERR_INVALID_ARGUMENT;
+    }
+
+    memset(stats_out, 0, sizeof(*stats_out));
+
+    const jq_state_t states[] = {JQ_STATE_JOBS, JQ_STATE_PRIORITY, JQ_STATE_COMPLETE, JQ_STATE_ERROR};
+    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+        jq_result_t result = jq_collect_state_stats(root_path,
+                                                    states[i],
+                                                    &stats_out->states[states[i]],
+                                                    &stats_out->oldest_mtime,
+                                                    &stats_out->newest_mtime);
+        if (result != JQ_OK) {
+            return result;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+        const jq_state_stats_t *state_stats = &stats_out->states[states[i]];
+        stats_out->total_jobs += state_stats->pdf_jobs + state_stats->metadata_jobs + state_stats->report_jobs;
+        stats_out->total_locked += state_stats->pdf_locked + state_stats->metadata_locked + state_stats->report_locked;
+        stats_out->total_orphans += state_stats->orphan_pdf + state_stats->orphan_metadata + state_stats->orphan_report;
+        stats_out->total_bytes += state_stats->pdf_bytes + state_stats->metadata_bytes + state_stats->report_bytes;
     }
 
     return JQ_OK;
