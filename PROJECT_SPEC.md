@@ -1,5 +1,23 @@
 # Project Specification: PDF Accessibility Promoter Pro
 
+## Current implementation status (2026-10-21)
+
+The numbered sections below define requirements and targets, not a statement
+that each capability has shipped. The current C accessibility path in
+`src/pdf_accessibility.c` scans PDF bytes for structure/metadata indicators and
+emits findings. `src/job_queue_analyze.c` writes JSON/HTML reports and finalizes
+the analysis job; it does not rewrite the PDF's structure tree or form objects.
+The token scan does not decode and resolve the complete PDF object graph, so
+findings can require confirmation, particularly for compressed content.
+
+Tag construction, qualified font/link/structure repairs and veraPDF checks are
+implemented in the separate [OpenAutoTag repository](https://github.com/DaisyQuest/OpenAutoTag).
+OpenAutoTag is not automatically invoked by this C analysis worker. Its measured
+results do not establish this repository's tagging, 5GB processing, coverage or
+production-readiness claims. See [capabilities and limitations](problems_we_correct.md)
+and `PROJECT_SPEC_COMPLETION_CHECKLIST.md` for the distinction between completed
+tasks and outstanding qualification.
+
 ## 1. Purpose
 PDF Accessibility Promoter Pro is a high-performance system for processing very large PDF documents (5GB+) to improve accessibility. The system must prioritize performance and accuracy over elegance while minimizing external dependencies.
 

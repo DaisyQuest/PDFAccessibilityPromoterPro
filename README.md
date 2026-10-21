@@ -1,5 +1,13 @@
 # PDFAccessibilityPromoterPro
 
+This repository contains the C job queue and PDF analysis workers. Its
+accessibility analyzer reports detected signals; it does not create or repair
+PDF tags. The tagging work discussed in the completion checklist belongs to the
+separate [OpenAutoTag engine](https://github.com/DaisyQuest/OpenAutoTag).
+See [current capability claims](problems_we_correct.md) and
+[implementation status](PROJECT_SPEC.md#current-implementation-status-2026-10-21)
+before treating a completed analysis job as a remediated PDF.
+
 ## Run the job queue server
 
 ```sh
