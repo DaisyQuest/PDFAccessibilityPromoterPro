@@ -2,6 +2,8 @@
 
 > Update this checklist only after completing tasks.
 
+- [x] OpenAutoTag 50-improvement batch 26 completed on 2026-10-23: A43 continued table rows and repeated header occurrences. Page-aware row identities prevent local-index collisions; section normalization retains page order, complete repeated bands keep distinct THs and nearest equivalent targets, and running artifacts no longer split declared tables. The 843-case baseline and final 42-case affected run cover the current 844 configured cases across overlapping runs. Native/raster output preserves the independent 40-cell oracle; native running-footer output also passes saved/raw checks. All 33 independent rendered pairs match, including field fill/save/reopen. Native fixture default-font findings, unchanged NIST failures and six booklet grid reviews remain explicit. Forty-three of 50 improvements complete; A44–A50 and human reader qualification remain. Evidence: OpenAutoTag docs/accessibility-50-batch26-20261023.md and docs/evidence/accessibility-50-batch26-20261023.json.
+
 ## Planning & Requirements
 - [ ] Project spec reviewed and approved.
 - [ ] Accessibility processing requirements confirmed.
